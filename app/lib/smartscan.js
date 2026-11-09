@@ -1,0 +1,278 @@
+/* Worksheet Studio — Smart worksheet scanner.
+ * Finds the four corner markers on a photo of a printed smart worksheet, works out the perspective
+ * (so rotated, tilted or angled photos are fine), reads the ID strip between the top markers, and
+ * straightens the page. Then it cuts out each question's answer area using the layout saved at print
+ * time, so the AI reads every answer next to the right question number.
+ * Everything here is plain canvas maths: no network, no libraries. */
+(function (root) {
+  'use strict';
+
+  // Geometry shared with core/render.js (CSS px at 96 per inch).
+  const R = root.Render;
+  const S = R.SMART, PAPERS = R.PAPER;
+
+  // ---------- image helpers ----------
+  function loadImage(b64) {
+    return new Promise((ok, no) => { const i = new Image(); i.onload = () => ok(i); i.onerror = () => no(new Error('A page image could not be opened')); i.src = 'data:image/jpeg;base64,' + b64; });
+  }
+  function toCanvas(img, maxSide) {
+    const k = Math.min(1, maxSide / Math.max(img.naturalWidth || img.width, img.naturalHeight || img.height));
+    const c = document.createElement('canvas');
+    c.width = Math.round((img.naturalWidth || img.width) * k); c.height = Math.round((img.naturalHeight || img.height) * k);
+    c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+    return c;
+  }
+  function gray(canvas) {
+    const { width: w, height: h } = canvas;
+    const d = canvas.getContext('2d').getImageData(0, 0, w, h).data;
+    const g = new Float32Array(w * h);
+    for (let i = 0, j = 0; i < g.length; i++, j += 4) g[i] = 0.299 * d[j] + 0.587 * d[j + 1] + 0.114 * d[j + 2];
+    return { g, w, h };
+  }
+
+  // ---------- marker detection ----------
+  function darkMask({ g, w, h }) {
+    // Local-mean threshold (window much larger than a marker) plus an absolute "really dark" test.
+    const I = new Float64Array((w + 1) * (h + 1));
+    for (let y = 0; y < h; y++) { let row = 0; for (let x = 0; x < w; x++) { row += g[y * w + x]; I[(y + 1) * (w + 1) + x + 1] = I[y * (w + 1) + x + 1] + row; } }
+    const sorted = Float32Array.from(g).sort();
+    const median = sorted[sorted.length >> 1];
+    const r = Math.max(8, Math.round(Math.min(w, h) / 9));
+    const m = new Uint8Array(w * h);
+    for (let y = 0; y < h; y++) {
+      const y0 = Math.max(0, y - r), y1 = Math.min(h, y + r + 1);
+      for (let x = 0; x < w; x++) {
+        const x0 = Math.max(0, x - r), x1 = Math.min(w, x + r + 1);
+        const sum = I[y1 * (w + 1) + x1] - I[y0 * (w + 1) + x1] - I[y1 * (w + 1) + x0] + I[y0 * (w + 1) + x0];
+        const mean = sum / ((x1 - x0) * (y1 - y0)), v = g[y * w + x];
+        m[y * w + x] = (v < mean * 0.72 || v < median * 0.42) ? 1 : 0;
+      }
+    }
+    return m;
+  }
+  function blobs(mask, w, h) {
+    const lab = new Int32Array(w * h), out = [], stack = new Int32Array(w * h);
+    let id = 0;
+    for (let s = 0; s < mask.length; s++) {
+      if (!mask[s] || lab[s]) continue;
+      id++;
+      let sp = 0; stack[sp++] = s; lab[s] = id;
+      const b = { n: 0, sx: 0, sy: 0, minx: w, maxx: 0, miny: h, maxy: 0, L: null, Rt: null, T: null, B: null };
+      while (sp) {
+        const p = stack[--sp], x = p % w, y = (p - x) / w;
+        b.n++; b.sx += x; b.sy += y;
+        if (x < b.minx) { b.minx = x; b.L = [x, y]; } if (x > b.maxx) { b.maxx = x; b.Rt = [x, y]; }
+        if (y < b.miny) { b.miny = y; b.T = [x, y]; } if (y > b.maxy) { b.maxy = y; b.B = [x, y]; }
+        if (x > 0 && mask[p - 1] && !lab[p - 1]) { lab[p - 1] = id; stack[sp++] = p - 1; }
+        if (x < w - 1 && mask[p + 1] && !lab[p + 1]) { lab[p + 1] = id; stack[sp++] = p + 1; }
+        if (y > 0 && mask[p - w] && !lab[p - w]) { lab[p - w] = id; stack[sp++] = p - w; }
+        if (y < h - 1 && mask[p + w] && !lab[p + w]) { lab[p + w] = id; stack[sp++] = p + w; }
+      }
+      out.push(b);
+    }
+    return out;
+  }
+  const quadArea = (pts) => { let a = 0; for (let i = 0; i < pts.length; i++) { const [x1, y1] = pts[i], [x2, y2] = pts[(i + 1) % pts.length]; a += x1 * y2 - x2 * y1; } return Math.abs(a) / 2; };
+  function markerCandidates(bl, w, h) {
+    const md = Math.min(w, h);
+    return bl.filter(b => {
+      const bw = b.maxx - b.minx + 1, bh = b.maxy - b.miny + 1;
+      if (bw < md * 0.012 || bh < md * 0.012 || bw > md * 0.11 || bh > md * 0.11) return false;
+      if (bw / bh > 1.9 || bh / bw > 1.9) return false;
+      // A filled square at any angle fills the quadrilateral through its four extreme points.
+      const qa = quadArea([b.L, b.T, b.Rt, b.B]);
+      const fillBox = b.n / (bw * bh);
+      return fillBox > 0.42 && (qa < 4 || b.n / qa > 0.78);
+    }).map(b => ({ x: b.sx / b.n, y: b.sy / b.n, size: Math.sqrt(b.n) }));
+  }
+
+  // ---------- homography ----------
+  function solve(A, b) {
+    const n = b.length;
+    for (let i = 0; i < n; i++) {
+      let p = i; for (let r = i + 1; r < n; r++) if (Math.abs(A[r][i]) > Math.abs(A[p][i])) p = r;
+      [A[i], A[p]] = [A[p], A[i]]; [b[i], b[p]] = [b[p], b[i]];
+      if (Math.abs(A[i][i]) < 1e-12) return null;
+      for (let r = i + 1; r < n; r++) { const f = A[r][i] / A[i][i]; for (let c = i; c < n; c++) A[r][c] -= f * A[i][c]; b[r] -= f * b[i]; }
+    }
+    const x = new Array(n);
+    for (let i = n - 1; i >= 0; i--) { let s = b[i]; for (let c = i + 1; c < n; c++) s -= A[i][c] * x[c]; x[i] = s / A[i][i]; }
+    return x;
+  }
+  // Maps page coordinates (src) to photo coordinates (dst).
+  function homography(src, dst) {
+    const A = [], b = [];
+    for (let i = 0; i < 4; i++) {
+      const [x, y] = src[i], [u, v] = dst[i];
+      A.push([x, y, 1, 0, 0, 0, -u * x, -u * y]); b.push(u);
+      A.push([0, 0, 0, x, y, 1, -v * x, -v * y]); b.push(v);
+    }
+    const h = solve(A, b);
+    return h && [...h, 1];
+  }
+  const apply = (H, x, y) => { const d = H[6] * x + H[7] * y + H[8]; return [(H[0] * x + H[1] * y + H[2]) / d, (H[3] * x + H[4] * y + H[5]) / d]; };
+
+  function markerCentres(P) {
+    const c = S.inset + S.marker / 2;
+    return [[c, c], [P.w - c, c], [P.w - c, P.h - c], [c, P.h - c]]; // TL, TR, BR, BL
+  }
+  function sampleAt(G, x, y) {
+    const xi = Math.round(x), yi = Math.round(y);
+    let s = 0, n = 0;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const X = xi + dx, Y = yi + dy;
+      if (X >= 0 && Y >= 0 && X < G.w && Y < G.h) { s += G.g[Y * G.w + X]; n++; }
+    }
+    return n ? s / n : 255;
+  }
+  function readStrip(G, H, P) {
+    const left = (P.w - 32 * S.cell) / 2, cy = S.stripTop + S.cellH / 2;
+    const v = [];
+    for (let i = 0; i < 32; i++) { const [x, y] = apply(H, left + (i + 0.5) * S.cell, cy); v.push(sampleAt(G, x, y)); }
+    const black = (v[0] + v[31]) / 2, white = (v[1] + v[30]) / 2;
+    if (white - black < 25) return null;
+    const t = (black + white) / 2, cells = v.slice(2, 30);
+    const id = R.smartDecode(cells.map(x => (x < t ? 1 : 0)));
+    if (!id) return null;
+    id.margin = Math.min(...cells.map(x => Math.abs(x - t))) / (white - black); // how cleanly every cell read
+    return id;
+  }
+
+  // Does each predicted marker look like a marker: dark in the middle, paper-white just outside it,
+  // and (top-left only) a white hole in the centre? Returns a score; null if any check fails.
+  function verify(G, H, P) {
+    const c = markerCentres(P), m = S.marker;
+    let score = 0;
+    for (let i = 0; i < 4; i++) {
+      const [cx, cy] = c[i];
+      const out = [[-0.95, 0], [0.95, 0], [0, -0.95], [0, 0.95]].map(([dx, dy]) => sampleAt(G, ...apply(H, cx + dx * m, cy + dy * m)));
+      const ink = [[-0.3, -0.3], [0.3, -0.3], [0.3, 0.3], [-0.3, 0.3]].map(([dx, dy]) => sampleAt(G, ...apply(H, cx + dx * m, cy + dy * m)));
+      const white = out.reduce((a, b) => a + b, 0) / 4, black = Math.max(...ink);
+      if (white - black < 30) return null;
+      if (i === 0) { const hole = sampleAt(G, ...apply(H, cx, cy)); if (hole - black < 0.4 * (white - black)) return null; }
+      else { const mid = sampleAt(G, ...apply(H, cx, cy)); if (mid - black > 0.5 * (white - black)) return null; }
+      score += white - black;
+    }
+    return score;
+  }
+
+  // Try the strongest corner candidates in every rotation and both paper sizes. A match needs the ID
+  // strip to decode AND all four markers to check out; the best-scoring match wins.
+  function locate(G, cands, paperFor) {
+    if (cands.length < 4) return null;
+    const pick = (score) => cands.slice().sort((a, b) => score(a) - score(b)).slice(0, 4);
+    const groups = [pick(c => c.x + c.y), pick(c => -c.x + c.y), pick(c => -c.x - c.y), pick(c => c.x - c.y)]; // photo TL, TR, BR, BL
+    const best = {};
+    for (const a of groups[0]) for (const b of groups[1]) for (const c of groups[2]) for (const d of groups[3]) {
+      const pts = [a, b, c, d];
+      if (new Set(pts).size < 4) continue;
+      const sizes = pts.map(p => p.size), mx = Math.max(...sizes), mn = Math.min(...sizes);
+      if (mx / mn > 3) continue;
+      for (let rot = 0; rot < 4; rot++) {
+        const dst = [0, 1, 2, 3].map(i => [pts[(i + rot) % 4].x, pts[(i + rot) % 4].y]);
+        for (const paper of ['Letter', 'A4']) {
+          const P = PAPERS[paper], H = homography(markerCentres(P), dst);
+          if (!H) continue;
+          const score = verify(G, H, P);
+          if (score === null || (best[paper] && score <= best[paper].score)) continue;
+          const id = readStrip(G, H, P);
+          if (id) best[paper] = { H, paper, P, id, score };
+        }
+      }
+    }
+    const found = Object.values(best);
+    if (!found.length) return null;
+    // Both paper sizes can fit the same four markers; the print record knows which was used.
+    const known = found.map(f => ({ f, p: paperFor && paperFor(f.id.code) })).find(x => x.p === x.f.paper);
+    return known ? known.f : found.sort((a, b) => b.id.margin - a.id.margin)[0];
+  }
+
+  // Straighten the page: a canvas of the whole printed page at `k` pixels per CSS pixel.
+  function warp(srcCanvas, H, P, k) {
+    const sw = srcCanvas.width, sh = srcCanvas.height;
+    const src = srcCanvas.getContext('2d').getImageData(0, 0, sw, sh).data;
+    const W = Math.round(P.w * k), Ht = Math.round(P.h * k);
+    const out = document.createElement('canvas'); out.width = W; out.height = Ht;
+    const ctx = out.getContext('2d'), od = ctx.createImageData(W, Ht), o = od.data;
+    for (let y = 0; y < Ht; y++) {
+      for (let x = 0; x < W; x++) {
+        const [u, v] = apply(H, x / k, y / k);
+        const j = (y * W + x) * 4;
+        if (u < 0 || v < 0 || u >= sw - 1 || v >= sh - 1) { o[j] = o[j + 1] = o[j + 2] = 255; o[j + 3] = 255; continue; }
+        const x0 = u | 0, y0 = v | 0, fx = u - x0, fy = v - y0;
+        const i00 = (y0 * sw + x0) * 4, i10 = i00 + 4, i01 = i00 + sw * 4, i11 = i01 + 4;
+        for (let c = 0; c < 3; c++) {
+          o[j + c] = (src[i00 + c] * (1 - fx) + src[i10 + c] * fx) * (1 - fy) + (src[i01 + c] * (1 - fx) + src[i11 + c] * fx) * fy;
+        }
+        o[j + 3] = 255;
+      }
+    }
+    ctx.putImageData(od, 0, 0);
+    return out;
+  }
+
+  /** Look at one photo. Returns { ok, code, page, paper, canvas (straightened) } or { ok: false }. */
+  async function analyzeOne(b64, paperFor) {
+    const img = await loadImage(b64);
+    const full = toCanvas(img, 2400);
+    const small = toCanvas(full, 1100);
+    const G = gray(small);
+    const cands = markerCandidates(blobs(darkMask(G), G.w, G.h), G.w, G.h);
+    const hit = locate(G, cands, paperFor);
+    if (!hit) return { ok: false };
+    const s = full.width / small.width;
+    const Hfull = hit.H.slice(); for (let i = 0; i < 3; i++) { Hfull[i] *= s; Hfull[3 + i] *= s; }
+    return { ok: true, code: hit.id.code, page: hit.id.page, paper: hit.paper, canvas: warp(full, Hfull, hit.P, 1.6), k: 1.6, P: hit.P };
+  }
+  async function analyze(images, paperFor) {
+    const out = [];
+    for (const b of images) { try { out.push(await analyzeOne(b, paperFor)); } catch (_) { out.push({ ok: false }); } }
+    return out;
+  }
+
+  /** Cut each question's area out of the straightened pages and stack them, labelled, into a few tall
+   *  images for the AI. layout.pages[n].items = [{ q, x, y, w, h }] in fractions of the marker frame. */
+  function answerBoards(found, layout) {
+    const pieces = [];
+    for (const f of found) {
+      const pg = layout.pages.find(p => p.n === f.page); if (!pg) continue;
+      const P = f.P, k = f.k, c0 = S.inset + S.marker / 2, fw = P.w - 2 * c0, fh = P.h - 2 * c0;
+      for (const it of pg.items) {
+        const pad = 6;
+        const x = Math.max(0, (c0 + it.x * fw - pad - 22) * k), y = Math.max(0, (c0 + it.y * fh - pad) * k);
+        const w = Math.min(f.canvas.width - x, (it.w * fw + 2 * pad + 22) * k), h = Math.min(f.canvas.height - y, (it.h * fh + 2 * pad) * k);
+        if (w > 4 && h > 4) pieces.push({ q: it.q, src: f.canvas, x, y, w, h });
+      }
+    }
+    pieces.sort((a, b) => a.q - b.q);
+    const W = 1100, LABEL = 34, GAP = 14, MAXH = 1900;
+    const boards = [];
+    let cur = [], curH = 0;
+    const flush = () => {
+      if (!cur.length) return;
+      const c = document.createElement('canvas'); c.width = W; c.height = curH;
+      const g = c.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(0, 0, W, curH);
+      let y = 0;
+      for (const p of cur) {
+        g.fillStyle = '#1B2A8A'; g.fillRect(0, y, W, LABEL);
+        g.fillStyle = '#fff'; g.font = 'bold 22px Helvetica, Arial, sans-serif'; g.textBaseline = 'middle';
+        g.fillText(`Question ${p.q}`, 12, y + LABEL / 2);
+        g.drawImage(p.src, p.x, p.y, p.w, p.h, 0, y + LABEL, p.dw, p.dh);
+        g.strokeStyle = '#1B2A8A'; g.lineWidth = 2; g.strokeRect(1, y + 1, W - 2, LABEL + p.dh - 2);
+        y += LABEL + p.dh + GAP;
+      }
+      boards.push(c.toDataURL('image/jpeg', 0.9).split(',')[1]);
+      cur = []; curH = 0;
+    };
+    for (const p of pieces) {
+      const sc = Math.min(W / p.w, 1.5); p.dw = Math.round(p.w * sc); p.dh = Math.round(p.h * sc);
+      const need = LABEL + p.dh + GAP;
+      if (curH + need > MAXH && cur.length) flush();
+      cur.push(p); curH += need;
+    }
+    flush();
+    return { boards, questions: pieces.map(p => p.q) };
+  }
+
+  root.SmartScan = { analyze, answerBoards, _internal: { darkMask, blobs, markerCandidates, homography, apply, locate, gray, readStrip } };
+})(typeof self !== 'undefined' ? self : this);
