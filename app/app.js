@@ -12,7 +12,7 @@
 
   const S = {
     key: ls.get('ws.key', ''), data: ls.get('ws.data', null), dataAt: ls.get('ws.dataAt', null), name: ls.get('ws.name', ''),
-    scans: ls.get('ws.scans', []), tab: 'home', filter: ls.get('ws.filter', 'all'), online: navigator.onLine, lastPull: 0, installEvt: null,
+    scans: ls.get('ws.scans', []), me: ls.get('ws.me', ''), tab: 'home', filter: ls.get('ws.filter', 'all'), online: navigator.onLine, lastPull: 0, installEvt: null,
   };
 
   // ---------------- cloud ----------------
@@ -29,6 +29,7 @@
       S.online = true;
       if (r.data) { S.data = r.data; S.dataAt = r.data_at; S.name = r.name; ls.set('ws.data', S.data); ls.set('ws.dataAt', S.dataAt); ls.set('ws.name', S.name); }
       S.lastPull = Date.now();
+      if (!pull.who) { pull.who = true; rpc('hh_whoami', { p_key: S.key }).then(w => { if (w && w.label) { S.me = w.label; ls.set('ws.me', S.me); renderTop(); } }).catch(() => {}); }
       await pullScans();
       render();
     } catch (e) { S.online = false; renderTop(); }
@@ -65,6 +66,19 @@
   const subj = (s) => { const m = SUBJ.find(([re]) => re.test(s || '')); return m ? { color: m[1], emoji: m[2] } : { color: '#5B6577', emoji: '📝' }; };
   const avatar = (id, name, cls) => `<span class="av ${cls || ''}" style="--c:${colorOf(id)}">${esc((name || '?').slice(0, 1).toUpperCase())}</span>`;
   const STATUS = { new: 'New', printed: 'Printed', started: 'Started', marking: 'Needs marking', graded: 'Graded' };
+  // The red pen: a hand-drawn loop around a handwritten letter. Each loop wobbles a little differently.
+  function mark(letterText, opts) {
+    const o = opts || {}, seed = String(letterText + (o.seed || '')).split('').reduce((a, c) => a * 31 + c.charCodeAt(0), 7);
+    const r = (k) => ((Math.sin(seed * (k + 1) * 12.9898) * 43758.5453) % 1 + 1) % 1;
+    const w = 100, h = 92, cx = 50, cy = 47, rx = 44 + r(1) * 3, ry = 38 + r(2) * 3;
+    const pts = [];
+    for (let i = 0; i <= 26; i++) {
+      const t = -0.5 + (i / 24) * Math.PI * 2, wob = 1 + (r(i + 3) - 0.5) * 0.06;
+      pts.push([cx + Math.cos(t) * rx * wob, cy + Math.sin(t) * ry * wob]);
+    }
+    const d = 'M' + pts.map(p => p[0].toFixed(1) + ' ' + p[1].toFixed(1)).join(' L');
+    return `<span class="mark ${o.big ? 'big' : ''} ${o.draw ? 'draw' : ''}" role="img" aria-label="Grade ${esc(letterText)}"><svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" aria-hidden="true"><path d="${d}"/></svg><b>${esc(letterText || '–')}</b></span>`;
+  }
   const todoSheets = () => D().sheets.filter(x => !x.arch && (x.status === 'new' || x.status === 'printed' || x.status === 'started'));
   const inFilter = (stId) => S.filter === 'all' || (S.filter === 'none' ? !stId : stId === S.filter);
   function toast(msg, ms, good) { const t = $('#toast'); t.textContent = msg; t.className = 'toast' + (good ? ' good' : ''); clearTimeout(toast.t); toast.t = setTimeout(() => t.classList.add('hidden'), ms || 3000); }
@@ -74,7 +88,7 @@
     const line = $('#syncLine');
     if (!S.key) { line.textContent = ''; return; }
     line.innerHTML = !S.online ? '<i class="dot off"></i>Offline: showing the last copy'
-      : `<i class="dot"></i>${esc(S.name || 'Your household')}${S.dataAt ? ` · updated ${esc(ago(S.dataAt))}` : ''}`;
+      : `<i class="dot"></i>${S.dataAt ? `Updated ${esc(ago(S.dataAt))}` : esc(S.name || 'Your household')}${S.me ? `, on ${esc(S.me)}` : ''}`;
     const n = todoSheets().length;
     $('#todoBadge').textContent = n ? (n > 99 ? '99+' : n) : '';
   }
@@ -126,27 +140,27 @@
     const hr = new Date().getHours();
     const live = S.scans.filter(x => x.state === 'received' || x.state === 'grading' || Date.now() - new Date(x.created_at) < 2 * 864e5).slice(0, 6);
     return `<section class="home">
-      <h1 class="hello">${hr < 12 ? 'Good morning' : hr < 18 ? 'Good afternoon' : 'Good evening'}</h1>
+      <h1 class="hello"><span>${hr < 12 ? 'Good morning' : hr < 18 ? 'Good afternoon' : 'Good evening'}</span></h1>
       ${S.installEvt ? `<button class="install" data-act="install"><img src="icons/icon-192.png" alt=""><span><b>Install the app</b><small>Opens from your home screen, like any app.</small></span><i>Install</i></button>` : ''}
-      <div class="stats">
-        <button class="stat s1" data-go="todo"><b>${todo.length}</b><span>to grade</span></button>
-        <button class="stat s2" data-go="graded"><b>${week.length}</b><span>graded this week</span></button>
-        <button class="stat s3" data-go="kids"><b>${avg == null ? '–' : avg + '%'}</b><span>average, 30 days</span></button>
+      <div class="reportCard">
+        <button data-go="todo"><b>${todo.length}</b><span>to grade</span></button>
+        <button data-go="graded"><b>${week.length}</b><span>graded this week</span></button>
+        <button data-go="kids"><b>${avg == null ? '–' : avg + '%'}</b><span>average, last 30 days</span></button>
       </div>
-      ${live.length ? `<h2>Scans</h2><div class="list">${live.map(scanRow).join('')}</div>` : ''}
+      ${live.length ? `<h2>Scans</h2><div class="list paper">${live.map(scanRow).join('')}</div>` : ''}
       <h2>Children</h2>
       ${d.students.length ? `<div class="kidCards">${d.students.map(kidCard).join('')}</div>` : '<p class="empty">Add students in Worksheet Studio on the Mac and they appear here.</p>'}
-      <button class="bigScan" data-go="scan"><span class="scanFab"><svg viewBox="0 0 24 24"><path d="M3 8V6a3 3 0 0 1 3-3h2M16 3h2a3 3 0 0 1 3 3v2M21 16v2a3 3 0 0 1-3 3h-2M8 21H6a3 3 0 0 1-3-3v-2"/><circle cx="12" cy="12" r="3.5"/></svg></span><span><b>Scan a finished worksheet</b><small>Your Mac grades it and the result shows up here.</small></span></button>
+      <button class="bigScan" data-go="scan"><img src="icons/icon-192.png" alt=""><span><b>Scan a finished worksheet</b><small>Your Mac grades it and the result shows up here.</small></span></button>
     </section>`;
   }
   function scanRow(x) {
     const st = x.state === 'received' ? ['wait', 'Waiting for your Mac', 'The Mac grades it as soon as Worksheet Studio is open.']
       : x.state === 'grading' ? ['busy', 'Being graded…', 'The Mac is reading the answers.']
-      : x.state === 'graded' ? ['done', x.result && x.result.letter ? `${x.result.letter} · ${x.result.pct}%` : 'Graded', x.result ? `${x.result.right || 0} right, ${x.result.wrong || 0} wrong${x.result.pending ? `, ${x.result.pending} to mark` : ''}` : '']
+      : x.state === 'graded' ? ['done', x.result && x.result.letter ? `${x.result.letter}, ${x.result.pct}%` : 'Graded', x.result ? `${x.result.right || 0} right, ${x.result.wrong || 0} wrong${x.result.pending ? `, ${x.result.pending} to mark` : ''}` : '']
       : ['err', 'Couldn’t grade', (x.result && x.result.message) || 'Scan it again.'];
     return `<div class="row scan ${st[0]}" ${x.state === 'error' ? `data-err="${esc(x.token)}"` : ''}>
       <span class="sIc">${st[0] === 'done' ? '★' : st[0] === 'err' ? '!' : st[0] === 'busy' ? '<i class="spin"></i>' : '⏳'}</span>
-      <span class="rMain"><b>${esc(x.title || 'Worksheet')}</b><small>${esc(x.student ? first(x.student) + ' · ' : '')}${esc(st[2])}</small></span>
+      <span class="rMain"><b>${esc(x.title || 'Worksheet')}</b><small>${esc(x.student ? first(x.student) + ': ' : '')}${esc(st[2])}</small></span>
       <span class="rSide"><b class="${st[0]}">${esc(st[1])}</b><small>${esc(ago(x.created_at))}</small></span>
     </div>`;
   }
@@ -155,8 +169,9 @@
     const avg = atts.length ? Math.round(atts.slice(0, 10).reduce((n, a) => n + a.pct, 0) / Math.min(10, atts.length)) : null;
     const todo = todoSheets().filter(x => x.st === st.id).length;
     return `<button class="kid" data-kid="${esc(st.id)}" style="--c:${colorOf(st.id)}">
-      ${avatar(st.id, st.name)}<span class="kMain"><b>${esc(st.name)}</b><small>${esc(gradeLabel(st.grade))}</small></span>
-      <span class="kNums"><b class="${gclass(avg)}">${avg == null ? '–' : letter(avg)}</b><small>${todo ? todo + ' to grade' : 'all caught up'}</small></span>
+      <span class="kTop">Hello<small>my name is</small></span>
+      <span class="kName">${esc(first(st.name))}</span>
+      <span class="kFoot"><span>${esc(gradeLabel(st.grade))}<br>${todo ? todo + ' to grade' : 'all caught up'}</span>${avg == null ? '' : mark(letter(avg), { seed: st.id })}</span>
     </button>`;
   }
 
@@ -171,15 +186,15 @@
     const su = subj(x.s);
     return `<button class="row sheetRow" data-sheet="${esc(x.k)}" style="--c:${su.color}">
       <span class="sub">${su.emoji}</span>
-      <span class="rMain"><b>${esc(x.tp || x.t)}</b><small>${esc(x.g)}${x.n > 1 ? ` · sheet ${x.i + 1} of ${x.n}` : ''}${x.sn ? ' · ' + esc(first(x.sn)) : ''}</small></span>
-      <span class="pill p-${x.status}">${STATUS[x.status] || ''}</span>
+      <span class="rMain"><b>${esc(x.tp || x.t)}</b><small>${x.sn ? esc(first(x.sn)) + ', ' : ''}${esc(x.g)}${x.n > 1 ? `, sheet ${x.i + 1} of ${x.n}` : ''}</small></span>
+      <span class="tag t-${x.status}">${STATUS[x.status] || 'Sent'}</span>
     </button>`;
   }
   function todoView() {
     const list = todoSheets().filter(x => inFilter(x.st)).sort((a, b) => (a.status === 'printed' ? 0 : a.status === 'started' ? 1 : 2) - (b.status === 'printed' ? 0 : b.status === 'started' ? 1 : 2) || (b.made || '').localeCompare(a.made || ''));
     const waiting = new Set(S.scans.filter(x => x.state === 'received' || x.state === 'grading').map(x => x.sheet_key));
-    return `<section><h1 class="pageT">To grade</h1>${chips()}
-      ${list.length ? `<p class="hint">Printed worksheets come first. Tap one to scan it when it's finished.</p><div class="list">${list.map(x => waiting.has(x.k) ? sheetRow(Object.assign({}, x, { status: 'sent' })).replace('class="pill p-sent">', 'class="pill p-sent">Sent') : sheetRow(x)).join('')}</div>`
+    return `<section><h1 class="pageT"><span>To grade</span></h1>${chips()}
+      ${list.length ? `<p class="hint">Printed ones first. Tap a worksheet to scan it when it's finished.</p><div class="list paper">${list.map(x => sheetRow(waiting.has(x.k) ? Object.assign({}, x, { status: 'sent' }) : x)).join('')}</div>`
         : `<div class="emptyBig"><span>🎉</span><b>Nothing waiting</b><small>Every worksheet${S.filter === 'all' ? '' : ' for ' + esc(first((student(S.filter) || {}).name || ''))} is graded.</small></div>`}
     </section>`;
   }
@@ -197,13 +212,13 @@
   function gradedView() {
     const atts = D().attempts.filter(a => inFilter(a.st));
     let lastDay = '';
-    return `<section><h1 class="pageT">Graded</h1>${chips()}
-      ${atts.length ? `<div class="list">${atts.slice(0, 150).map(a => {
+    return `<section><h1 class="pageT"><span>Graded</span></h1>${chips()}
+      ${atts.length ? `<div class="list paper">${atts.slice(0, 150).map(a => {
         const dd = day(a.at), head = dd !== lastDay ? `<div class="dayHead">${esc(dd)}</div>` : ''; lastDay = dd;
         const st = student(a.st), su = subj(a.s);
         return `${head}<button class="row resRow" data-att="${esc(a.id)}">
-          <span class="grade g-${gclass(a.pct)}">${esc(letter(a.pct))}</span>
-          <span class="rMain"><b>${esc(a.tp || a.t)}</b><small>${su.emoji} ${esc(st ? first(st.name) : '')}${a.pend ? ` · ${a.pend} to mark on the Mac` : ''}</small></span>
+          ${mark(letter(a.pct), { seed: a.id })}
+          <span class="rMain"><b>${esc(a.tp || a.t)}</b><small>${su.emoji} ${esc(st ? first(st.name) : '')}${a.pend ? `, ${a.pend} to mark on the Mac` : ''}</small></span>
           <span class="pct">${a.pct == null ? '' : a.pct + '%'}</span></button>`;
       }).join('')}</div>` : '<div class="emptyBig"><span>📝</span><b>No results yet</b><small>Scan a finished worksheet and its result shows up here.</small></div>'}
     </section>`;
@@ -211,19 +226,19 @@
   function resultDetail(id) {
     const a = D().attempts.find(x => x.id === id); if (!a) return;
     const st = student(a.st);
-    const mark = (c) => c === 1 ? ['qok', '✓'] : c === 0.5 ? ['qhalf', '½'] : c === 0 ? ['qno', '✗'] : ['qwait', '?'];
+    const markOf = (c) => c === 1 ? ['qok', '✓'] : c === 0.5 ? ['qhalf', '½'] : c === 0 ? ['qno', '✗'] : ['qwait', '?'];
     const right = a.r.filter(r => r[1] === 1).length, wrong = a.r.filter(r => r[1] === 0).length;
-    openSheet(`<div class="resHead"><span class="bigGrade g-${gclass(a.pct)}">${esc(letter(a.pct))}<small>${a.pct == null ? '' : a.pct + '%'}</small></span>
-        <div><h2>${esc(a.tp || a.t)}</h2><p>${esc(st ? st.name : '')} · ${esc(day(a.at))}</p><p class="tally"><b class="ok">${right} right</b> · <b class="no">${wrong} wrong</b>${a.pend ? ` · ${a.pend} to mark` : ''}</p></div></div>
-      <ol class="qs">${a.r.map(r => { const [cls, sym] = mark(r[1]); return `<li class="${cls}"><span class="qm">${sym}</span><div><p class="qq"><b>${r[0]}.</b> ${esc(r[4])}</p>
-        <p class="qa">Answer: <b>${esc(r[2]) || '<i>blank</i>'}</b>${r[1] !== 1 && r[3] ? `<br><span class="key">Correct: ${esc(r[3])}</span>` : ''}</p></div></li>`; }).join('')}</ol>
+    openSheet(`<div class="resHead">${mark(letter(a.pct), { big: true, draw: true, seed: a.id })}
+        <div><h2>${esc(a.tp || a.t)}</h2><p>${esc(st ? st.name : '')}, ${esc(day(a.at))}${a.pct == null ? '' : `, ${a.pct}%`}</p><p class="tally"><b class="qok">${right} right</b>, <b class="qno">${wrong} wrong</b>${a.pend ? `, ${a.pend} to mark` : ''}</p></div></div>
+      <ol class="qs">${a.r.map(r => { const [cls, sym] = markOf(r[1]); return `<li class="${cls}"><span class="qm">${sym}</span><div><p class="qq"><b>${r[0]}.</b> ${esc(r[4])}</p>
+        <p class="qa">Answer: <b>${esc(r[2]) || '<i>blank</i>'}</b>${r[1] !== 1 && r[3] ? `<br><span class="key">${esc(r[3])}</span>` : ''}</p></div></li>`; }).join('')}</ol>
       <button class="ghost wide" data-close>Close</button>`);
   }
 
   // ---------------- progress ----------------
   function kidsView() {
     const d = D();
-    if (!d.students.length) return '<section><h1 class="pageT">Progress</h1><div class="emptyBig"><span>👧</span><b>No students yet</b><small>Add them in Worksheet Studio on the Mac.</small></div></section>';
+    if (!d.students.length) return '<section><h1 class="pageT"><span>Progress</span></h1><div class="emptyBig"><span>👧</span><b>No students yet</b><small>Add them in Worksheet Studio on the Mac.</small></div></section>';
     const sel = d.students.find(s => s.id === S.filter) || d.students[0];
     const atts = d.attempts.filter(a => a.st === sel.id && a.pct != null);
     const bySub = {};
@@ -235,22 +250,23 @@
     const avg = atts.length ? Math.round(atts.reduce((n, a) => n + a.pct, 0) / atts.length) : null;
     const trend = atts.slice(0, 12).reverse();
     const week = atts.filter(a => Date.now() - new Date(a.at) < 7 * 864e5).length;
-    return `<section><h1 class="pageT">Progress</h1>
+    return `<section><h1 class="pageT"><span>Progress</span></h1>
       <div class="chips">${d.students.map(s => `<button data-filter="${esc(s.id)}" class="${s.id === sel.id ? 'on' : ''}">${esc(first(s.name))}</button>`).join('')}</div>
-      <div class="kidHero" style="--c:${colorOf(sel.id)}">${avatar(sel.id, sel.name, 'big')}<div><h2>${esc(sel.name)}</h2><p>${esc(gradeLabel(sel.grade))}</p></div>
-        <div class="kh"><b class="${gclass(avg)}">${avg == null ? '–' : letter(avg)}</b><small>${avg == null ? 'no results yet' : avg + '% average'}</small></div></div>
-      <div class="stats mini"><div class="stat"><b>${atts.length}</b><span>graded</span></div><div class="stat"><b>${week}</b><span>this week</span></div><div class="stat"><b>${todoSheets().filter(x => x.st === sel.id).length}</b><span>to grade</span></div></div>
+      <div class="kidHero" style="--c:${colorOf(sel.id)}"><div><h2>${esc(sel.name)}</h2><p>${esc(gradeLabel(sel.grade))}${avg == null ? ', no results yet' : `, ${avg}% average`}</p></div>
+        ${avg == null ? '' : mark(letter(avg), { big: true, seed: sel.id })}</div>
+      <div class="reportCard mini"><div><b>${atts.length}</b><span>graded</span></div><div><b>${week}</b><span>this week</span></div><div><b>${todoSheets().filter(x => x.st === sel.id).length}</b><span>to grade</span></div></div>
       ${trend.length > 1 ? `<h2>Recent scores</h2><div class="card">${spark(trend.map(a => a.pct))}</div>` : ''}
-      ${subs.length ? `<h2>By subject</h2><div class="card bars">${subs.map(([s, p, n]) => `<div class="bar"><span class="bl">${subj(s).emoji} ${esc(s)}</span><b class="${gclass(p)}">${p}%</b><small>${n} done</small><span class="bt"><i style="width:${p}%;--c:${subj(s).color}"></i></span></div>`).join('')}</div>` : ''}
+      ${subs.length ? `<h2>By subject</h2><div class="card bars">${subs.map(([s, p, n]) => `<div class="bar"><span class="bl">${subj(s).emoji} ${esc(s)}</span><b class="${gclass(p)}">${p}%</b><span class="bt"><i style="width:${p}%;--c:${subj(s).color}"></i></span><small>${n} worksheet${n === 1 ? '' : 's'}</small></div>`).join('')}</div>` : ''}
       ${weak.length ? `<h2>Needs practice</h2><div class="card weak">${weak.map(([t, p]) => `<div><span>${esc(t)}</span><b class="${gclass(p)}">${p}%</b></div>`).join('')}<p class="fine">Make a new worksheet on these from the student's page on the Mac.</p></div>` : atts.length ? '<h2>Needs practice</h2><div class="card"><p class="fine">Nothing below 75%. Nice work!</p></div>' : ''}
     </section>`;
   }
   function spark(v) {
-    const W = 320, H = 90, n = v.length, x = (i) => 10 + (i * (W - 20)) / Math.max(1, n - 1), y = (p) => H - 10 - (p / 100) * (H - 20);
+    const W = 320, H = 96, n = v.length, lo = Math.max(0, Math.min(50, Math.min(...v) - 10));
+    const x = (i) => 46 + (i * (W - 60)) / Math.max(1, n - 1), y = (p) => H - 12 - ((p - lo) / (100 - lo)) * (H - 24);
     const pts = v.map((p, i) => `${x(i).toFixed(1)},${y(p).toFixed(1)}`).join(' ');
-    return `<svg class="spark" viewBox="0 0 ${W} ${H}" role="img" aria-label="Recent scores: ${v.join(', ')} percent">
-      <line x1="10" x2="${W - 10}" y1="${y(80)}" y2="${y(80)}" class="ref"/><text x="${W - 10}" y="${y(80) - 4}" class="refT">80%</text>
-      <polyline points="${pts}" class="ln"/>${v.map((p, i) => `<circle cx="${x(i)}" cy="${y(p)}" r="4" class="pt ${gclass(p)}"/>`).join('')}</svg>`;
+    return `<svg class="spark" viewBox="0 0 ${W} ${H}" role="img" aria-label="Recent scores, oldest to newest: ${v.join(', ')} percent">
+      <line x1="36" x2="${W}" y1="${y(80)}" y2="${y(80)}" class="ref"/><text x="2" y="${y(80) + 4}" class="refT" style="text-anchor:start">80%</text>
+      <polyline points="${pts}" class="ln"/>${v.map((p, i) => `<circle cx="${x(i)}" cy="${y(p)}" r="4.5" class="pt ${gclass(p)}"/>`).join('')}</svg>`;
   }
 
   // ---------------- sheet (bottom panel) ----------------
@@ -314,9 +330,9 @@
     const have = x ? new Set(pagesFrom(x.k).map(p => p.page)) : new Set();
     const missing = smartInfo && have.size ? Array.from({ length: smartInfo.pages }, (_, i) => i).filter(i => !have.has(i)) : [];
     $('#view').innerHTML = `<section class="scanV">
-      <h1 class="pageT">Scan a worksheet</h1>
+      <h1 class="pageT"><span>Scan a worksheet</span></h1>
       <div class="which ${x ? 'set' : ''}">
-        ${x ? `<span class="sub">${subj(x.s).emoji}</span><span class="rMain"><b>${esc(x.tp || x.t)}</b><small>${esc(x.sn || 'Anyone')}${x.n > 1 ? ` · sheet ${x.i + 1} of ${x.n}` : ''}${SC.pages.some(p => p.sheet === x.k) ? ' · recognised from the page ✓' : ''}</small></span><button class="link" data-act="pick">Change</button>`
+        ${x ? `<span class="sub">${subj(x.s).emoji}</span><span class="rMain"><b>${esc(x.tp || x.t)}</b><small>${esc(x.sn ? first(x.sn) : 'Anyone')}${x.n > 1 ? `, sheet ${x.i + 1} of ${x.n}` : ''}${SC.pages.some(p => p.sheet === x.k) ? ', recognised from the page ✓' : ''}</small></span><button class="link" data-act="pick">Change</button>`
           : `<span class="sub">❓</span><span class="rMain"><b>Which worksheet?</b><small>${n ? (SC.pages.some(p => p.checking) ? 'Reading the page…' : 'Couldn’t tell from the photo. Pick it from the list.') : 'Take a photo and it’s usually recognised automatically.'}</small></span><button class="link" data-act="pick">Pick</button>`}
       </div>
       ${mismatch ? '<p class="warn">Some pages belong to a different worksheet. Remove them, or press Change.</p>' : ''}
@@ -348,7 +364,7 @@
   }
   function pickSheet() {
     const list = D().sheets.filter(x => !x.arch && x.status !== 'graded').sort((a, b) => (a.status === 'printed' ? 0 : 1) - (b.status === 'printed' ? 0 : 1) || (b.made || '').localeCompare(a.made || ''));
-    openSheet(`<h2>Which worksheet is this?</h2><div class="list pickList">${list.slice(0, 80).map(sheetRow).join('') || '<p class="empty">No worksheets are waiting to be graded.</p>'}</div><button class="ghost wide" data-close>Cancel</button>`);
+    openSheet(`<h2>Which worksheet is this?</h2><div class="list paper pickList">${list.slice(0, 80).map(sheetRow).join('') || '<p class="empty">No worksheets are waiting to be graded.</p>'}</div><button class="ghost wide" data-close>Cancel</button>`);
     $('#sheetPanel').dataset.picking = '1';
   }
   async function send() {
@@ -391,6 +407,16 @@
     const a = t.closest('[data-act]'); if (!a) return;
     const act = a.dataset.act;
     if (act === 'pick') return pickSheet();
+    if (act === 'me') {
+      if (!S.key) return;
+      return openSheet(`<div class="shHead"><img src="icons/icon-192.png" alt="" style="width:56px;height:56px;border-radius:16px;transform:rotate(-6deg)"><div><h2>${esc(S.me || 'This phone')}</h2><p>Linked to ${esc(S.name || 'your household')}</p></div></div>
+        <p class="me">To rename this phone or unlink it for good, use Settings, then Phone app, on the Mac.</p>
+        <button class="ghost wide" data-act="forget">Unlink this phone here</button><button class="primary wide" data-close>Close</button>`);
+    }
+    if (act === 'forget') {
+      if (!confirm('Unlink this phone? You will need a new code from the Mac to link it again.')) return;
+      closeSheet(); S.me = ''; ls.set('ws.me', ''); S.key = ''; ls.set('ws.key', ''); S.data = null; ls.set('ws.data', null); return render();
+    }
     if (act === 'send') return send();
     if (act === 'clear') { clearDraft(); return renderScan(); }
     if (act === 'install' && S.installEvt) { S.installEvt.prompt(); const c = await S.installEvt.userChoice.catch(() => null); S.installEvt = null; render(); if (c && c.outcome === 'accepted') toast('Installed! Open it from your home screen.', 4000, true); }

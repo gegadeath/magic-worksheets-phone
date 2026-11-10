@@ -9,12 +9,14 @@
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icons/icon-192.png">
 <link rel="apple-touch-icon" href="icons/apple-touch.png">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600;700&family=Gaegu:wght@400;700&display=swap">
 <link rel="stylesheet" href="app.css">
 </head>
 <body>
 <div id="app">
   <header class="top" id="top">
-    <img class="logo" src="icons/icon-192.png" alt="">
+    <button class="logoBtn" data-act="me" aria-label="About this phone"><img class="logo" src="icons/icon-192.png" alt=""></button>
     <div class="topText"><b id="topTitle">Worksheet Studio</b><span id="syncLine"></span></div>
     <button class="iconBtn" id="refreshBtn" aria-label="Refresh"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg></button>
   </header>
@@ -22,7 +24,7 @@
   <nav class="tabs" id="tabs" aria-label="Sections">
     <button data-tab="home" class="on"><svg viewBox="0 0 24 24"><path d="M3 11 12 3l9 8v9a1 1 0 0 1-1 1h-5v-6h-6v6H4a1 1 0 0 1-1-1z"/></svg><span>Home</span></button>
     <button data-tab="todo"><svg viewBox="0 0 24 24"><rect x="5" y="3" width="14" height="18" rx="2"/><path d="M9 8h6M9 12h6M9 16h3"/></svg><span>To grade</span><i class="badge" id="todoBadge"></i></button>
-    <button data-tab="scan" class="scanTab" aria-label="Scan a worksheet"><span class="scanFab"><svg viewBox="0 0 24 24"><path d="M3 8V6a3 3 0 0 1 3-3h2M16 3h2a3 3 0 0 1 3 3v2M21 16v2a3 3 0 0 1-3 3h-2M8 21H6a3 3 0 0 1-3-3v-2"/><circle cx="12" cy="12" r="3.5"/></svg></span><span>Scan</span></button>
+    <button data-tab="scan" class="scanTab" aria-label="Scan a worksheet"><span class="robotBtn"><img src="icons/icon-192.png" alt=""></span><span>Scan</span></button>
     <button data-tab="graded"><svg viewBox="0 0 24 24"><path d="m12 3 2.7 5.6 6.1.9-4.4 4.3 1 6.1L12 17l-5.4 2.9 1-6.1L3.2 9.5l6.1-.9z"/></svg><span>Graded</span></button>
     <button data-tab="kids"><svg viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0"/><path d="M16 4.5a3.5 3.5 0 0 1 0 7M21.5 20a6.5 6.5 0 0 0-4-6"/></svg><span>Progress</span></button>
   </nav>

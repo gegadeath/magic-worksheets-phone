@@ -1,6 +1,6 @@
 /* Worksheet Studio phone app: keeps the app itself available offline and starts instantly.
    Data always comes fresh from the network; the app keeps its own copy for offline viewing. */
-const CACHE = 'ws-app-v1';
+const CACHE = 'ws-app-v2';
 const SHELL = ['./', './index.html', './app.css', './app.js', './lib/render.js', './lib/smartscan.js', './manifest.webmanifest',
   './icons/icon-192.png', './icons/icon-512.png', './icons/maskable-192.png', './icons/maskable-512.png'];
 
