@@ -230,6 +230,146 @@
     return out;
   }
 
+  // ---------- phone helpers: live camera frames, photo checks, cleanup ----------
+
+  /** Find a smart page in one small camera frame (about 640 px wide). Fast enough for several frames a second.
+   *  Returns the page's code and page number plus where its four corner squares and outline are in the frame. */
+  function detectFrame(canvas, paperFor) {
+    const G = gray(canvas);
+    const cands = markerCandidates(blobs(darkMask(G), G.w, G.h), G.w, G.h);
+    const hit = locate(G, cands, paperFor);
+    if (!hit) return { ok: false };
+    const P = hit.P;
+    return {
+      ok: true, code: hit.id.code, page: hit.id.page, paper: hit.paper, H: hit.H, P,
+      corners: markerCentres(P).map(([x, y]) => apply(hit.H, x, y)),
+      outline: [[0, 0], [P.w, 0], [P.w, P.h], [0, P.h]].map(([x, y]) => apply(hit.H, x, y)),
+    };
+  }
+
+  /** Same as analyze() for one photo, but from a canvas: finds the page and returns it straightened. */
+  function analyzeCanvas(full, paperFor, k) {
+    const small = toCanvas(full, 1100);
+    const G = gray(small);
+    const hit = locate(G, markerCandidates(blobs(darkMask(G), G.w, G.h), G.w, G.h), paperFor);
+    if (!hit) return { ok: false };
+    const s = full.width / small.width;
+    const Hf = hit.H.slice(); for (let i = 0; i < 3; i++) { Hf[i] *= s; Hf[3 + i] *= s; }
+    const kk = k || 1.6;
+    return { ok: true, code: hit.id.code, page: hit.id.page, paper: hit.paper, canvas: warp(full, Hf, hit.P, kk), k: kk, P: hit.P };
+  }
+
+  /** How usable is this photo? brightness 0-255 (mean), sharpness (spread of edge strength; higher is
+   *  crisper), glare (share of blown-out white pixels). Measured on a copy about 900 px on its long side. */
+  function quality(canvas) {
+    const c = toCanvas(canvas, 900), G = gray(c), { g, w, h } = G;
+    let sum = 0; for (let i = 0; i < g.length; i++) sum += g[i];
+    const mean = sum / g.length;
+    // variance of the Laplacian over the middle 80% (edges of the photo are often table or shadow)
+    const x0 = Math.round(w * 0.1), x1 = Math.round(w * 0.9), y0 = Math.round(h * 0.1), y1 = Math.round(h * 0.9);
+    let n = 0, m = 0, m2 = 0, blown = 0;
+    for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) {
+      const i = y * w + x;
+      const L = 4 * g[i] - g[i - 1] - g[i + 1] - g[i - w] - g[i + w];
+      n++; const d = L - m; m += d / n; m2 += d * (L - m);
+      if (g[i] > 250) blown++;
+    }
+    return { brightness: mean, sharpness: n > 1 ? m2 / (n - 1) : 0, glare: blown / Math.max(1, n) };
+  }
+
+  /** Even out shadows and uneven light: divide every pixel by an estimate of the bare paper's brightness
+   *  around it (the photo with all ink removed by a wide "max" filter, then blurred). Works in place. */
+  function evenLight(canvas) {
+    const W = canvas.width, H = canvas.height, ctx = canvas.getContext('2d');
+    const f = 8, sw = Math.max(8, Math.round(W / f)), sh = Math.max(8, Math.round(H / f));
+    const sm = document.createElement('canvas'); sm.width = sw; sm.height = sh;
+    sm.getContext('2d').drawImage(canvas, 0, 0, sw, sh);
+    const sd = sm.getContext('2d').getImageData(0, 0, sw, sh).data;
+    let B = new Float32Array(sw * sh);
+    for (let i = 0, j = 0; i < B.length; i++, j += 4) B[i] = Math.max(sd[j], sd[j + 1], sd[j + 2]);
+    const pass = (src, r, op) => { // separable max filter or box blur
+      const out = new Float32Array(src.length), tmp = new Float32Array(src.length);
+      for (let y = 0; y < sh; y++) for (let x = 0; x < sw; x++) {
+        let v = op === 'max' ? 0 : 0, c = 0;
+        for (let k = -r; k <= r; k++) { const X = Math.min(sw - 1, Math.max(0, x + k)), q = src[y * sw + X]; if (op === 'max') { if (q > v) v = q; } else { v += q; c++; } }
+        tmp[y * sw + x] = op === 'max' ? v : v / c;
+      }
+      for (let y = 0; y < sh; y++) for (let x = 0; x < sw; x++) {
+        let v = 0, c = 0;
+        for (let k = -r; k <= r; k++) { const Y = Math.min(sh - 1, Math.max(0, y + k)), q = tmp[Y * sw + x]; if (op === 'max') { if (q > v) v = q; } else { v += q; c++; } }
+        out[y * sw + x] = op === 'max' ? v : v / c;
+      }
+      return out;
+    };
+    B = pass(pass(pass(B, 4, 'max'), 4, 'box'), 3, 'box');
+    const img = ctx.getImageData(0, 0, W, H), d = img.data;
+    for (let y = 0; y < H; y++) {
+      const fy = Math.min(sh - 1.001, Math.max(0, (y + 0.5) / f - 0.5)), y0 = fy | 0, ty = fy - y0;
+      for (let x = 0; x < W; x++) {
+        const fx = Math.min(sw - 1.001, Math.max(0, (x + 0.5) / f - 0.5)), x0 = fx | 0, tx = fx - x0;
+        const i0 = y0 * sw + x0;
+        const bg = (B[i0] * (1 - tx) + B[i0 + 1] * tx) * (1 - ty) + (B[i0 + sw] * (1 - tx) + B[i0 + sw + 1] * tx) * ty;
+        const gain = 248 / Math.max(60, bg), j = (y * W + x) * 4;
+        for (let c = 0; c < 3; c++) { const v = d[j + c] * gain; d[j + c] = v > 255 ? 255 : v; }
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+    return canvas;
+  }
+
+  /** Pages without corner squares: find the sheet of paper against the table (the biggest bright,
+   *  four-sided shape), then straighten and crop to it. Returns a new canvas, or null if no clear page. */
+  function flattenDocument(full) {
+    const small = toCanvas(full, 480), w = small.width, h = small.height;
+    const d = small.getContext('2d').getImageData(0, 0, w, h).data;
+    // light blur so paper texture and JPEG noise don't stop the growth
+    const R = new Float32Array(w * h), Gc = new Float32Array(w * h), Bc = new Float32Array(w * h);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      let r = 0, g = 0, b = 0, n = 0;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        const X = Math.min(w - 1, Math.max(0, x + dx)), Y = Math.min(h - 1, Math.max(0, y + dy)), j = (Y * w + X) * 4;
+        r += d[j]; g += d[j + 1]; b += d[j + 2]; n++;
+      }
+      const i = y * w + x; R[i] = r / n; Gc[i] = g / n; Bc[i] = b / n;
+    }
+    // Grow the sheet outward from the middle of the photo. Shadows change gradually from pixel to pixel;
+    // the edge of the paper against the table is a sudden step, so the growth stops there.
+    const lum = (i) => 0.299 * R[i] + 0.587 * Gc[i] + 0.114 * Bc[i];
+    const cx = w >> 1, cy = h >> 1, rad = Math.round(Math.min(w, h) * 0.08);
+    const seeds = [];
+    for (let y = cy - rad; y <= cy + rad; y++) for (let x = cx - rad; x <= cx + rad; x++) seeds.push(y * w + x);
+    const sl = seeds.map(lum).sort((p, q) => p - q), bright = sl[Math.floor(sl.length * 0.7)];
+    const lab = new Uint8Array(w * h), stack = new Int32Array(w * h);
+    let sp = 0;
+    for (const i of seeds) if (lum(i) >= bright * 0.9) { lab[i] = 1; stack[sp++] = i; }
+    const big = { n: 0, s1: Infinity, s2: -Infinity, s3: -Infinity, s4: -Infinity, tl: null, tr: null, br: null, bl: null, edge: 0 };
+    const step = (a, b) => Math.abs(R[a] - R[b]) + Math.abs(Gc[a] - Gc[b]) + Math.abs(Bc[a] - Bc[b]);
+    while (sp) {
+      const q = stack[--sp], x = q % w, y = (q - x) / w;
+      big.n++;
+      if (x === 0 || y === 0 || x === w - 1 || y === h - 1) big.edge++;
+      if (x + y < big.s1) { big.s1 = x + y; big.tl = [x, y]; }
+      if (x - y > big.s2) { big.s2 = x - y; big.tr = [x, y]; }
+      if (x + y > big.s3) { big.s3 = x + y; big.br = [x, y]; }
+      if (y - x > big.s4) { big.s4 = y - x; big.bl = [x, y]; }
+      const nb = [x > 0 ? q - 1 : -1, x < w - 1 ? q + 1 : -1, y > 0 ? q - w : -1, y < h - 1 ? q + w : -1];
+      for (const k of nb) if (k >= 0 && !lab[k] && step(q, k) < 18 && lum(k) > bright * 0.22) { lab[k] = 1; stack[sp++] = k; }
+    }
+    // grow through the dark print inside the page too: fill holes by taking the region's outline only
+    if (big.n < w * h * 0.15 || big.n > w * h * 0.97) return null;
+    if (big.edge > (w + h) * 1.2) return null; // ran off along the photo's edges: the table and the page look alike
+    const tl = big.tl, tr = big.tr, br = big.br, bl2 = big.bl;
+    const quad = [tl, tr, br, bl2];
+    const area = Math.abs(quad.reduce((a, p, i) => { const q = quad[(i + 1) % 4]; return a + p[0] * q[1] - q[0] * p[1]; }, 0)) / 2;
+    if (area < w * h * 0.15 || big.n / area < 0.6 || big.n / area > 1.08) return null; // not a clean four-sided sheet
+    const s = full.width / w, Q = quad.map(([x, y]) => [x * s, y * s]);
+    const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
+    const ow = Math.round(Math.max(dist(Q[0], Q[1]), dist(Q[3], Q[2]))), oh = Math.round(Math.max(dist(Q[0], Q[3]), dist(Q[1], Q[2])));
+    if (ow < 200 || oh < 200) return null;
+    const Hm = homography([[0, 0], [ow, 0], [ow, oh], [0, oh]], Q);
+    return Hm ? warp(full, Hm, { w: ow, h: oh }, 1) : null;
+  }
+
   /** Cut each question's area out of the straightened pages and stack them, labelled, into a few tall
    *  images for the AI. layout.pages[n].items = [{ q, x, y, w, h }] in fractions of the marker frame. */
   function answerBoards(found, layout) {
@@ -274,5 +414,5 @@
     return { boards, questions: pieces.map(p => p.q) };
   }
 
-  root.SmartScan = { analyze, answerBoards, _internal: { darkMask, blobs, markerCandidates, homography, apply, locate, gray, readStrip } };
+  root.SmartScan = { analyze, answerBoards, detectFrame, analyzeCanvas, quality, evenLight, flattenDocument, toCanvas, _internal: { darkMask, blobs, markerCandidates, homography, apply, locate, gray, readStrip } };
 })(typeof self !== 'undefined' ? self : this);

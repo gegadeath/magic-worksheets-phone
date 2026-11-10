@@ -210,7 +210,7 @@ h2 { font-size: 18px; margin: 24px 0 10px; }
 .pg.bad { outline: 3px solid var(--pen); }
 .pg img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .pgL { position: absolute; left: 0; right: 0; bottom: 0; text-align: center; font-family: var(--hand); font-weight: 700; font-size: 15px; color: var(--ink); display: flex; align-items: center; justify-content: center; gap: 4px; }
-.pg button { position: absolute; right: -8px; top: -8px; width: 28px; height: 28px; border-radius: 50%; border: 2px solid var(--ink); background: var(--paper); color: var(--ink); font-size: 18px; line-height: 1; font-weight: 700; }
+.pg button.pgX { position: absolute; right: -8px; top: -8px; width: 28px; height: 28px; border-radius: 50%; border: 2px solid var(--ink); background: var(--paper); color: var(--ink); font-size: 18px; line-height: 1; font-weight: 700; }
 .pg::before { content: ""; position: absolute; left: 50%; top: -8px; width: 34px; height: 14px; margin-left: -17px; background: rgba(255,225,90,.75); transform: rotate(-3deg); }
 .addTile { display: grid; place-items: center; aspect-ratio: 3 / 4; border: 2.5px dashed var(--ink3); color: var(--ink2); font-family: var(--hand); font-weight: 700; font-size: 17px; text-align: center; padding: 8px; background: rgba(255,255,255,.6); line-height: 1.1; }
 .addTile b { display: block; font-family: var(--display); font-size: 32px; color: var(--blue); }
@@ -233,3 +233,55 @@ h2 { font-size: 18px; margin: 24px 0 10px; }
 
 .logoBtn { border: 0; background: none; padding: 0; }
 .list.paper > .row { min-height: 60px; }
+
+/* ---------- scan: page tiles, checks, outbox ---------- */
+button.addTile { font: inherit; font-family: var(--hand); font-weight: 700; font-size: 17px; color: var(--ink2); width: 100%; }
+.pg button.pgRetake { left: 50%; right: auto; top: auto; bottom: 26px; width: auto; height: auto; transform: translateX(-50%); border-radius: 999px; padding: 4px 12px; font-family: var(--display); font-size: 13px; font-weight: 600; background: var(--hl); box-shadow: 2px 2px 0 var(--ink); }
+.pg.warn { outline: 3px solid var(--amber); }
+.pgFlag { position: absolute; left: 6px; top: 10px; padding: 2px 8px; border-radius: 6px; font-family: var(--display); font-size: 12px; font-weight: 600; color: #fff; background: var(--amber); transform: rotate(-4deg); }
+.pgFlag.bad { background: var(--pen); }
+.pgWait { display: grid; place-content: center; justify-items: center; gap: 6px; height: 100%; background: var(--grid); font-family: var(--hand); font-size: 15px; color: var(--ink2); }
+.checkList { margin: 0 0 16px; padding: 10px 14px 10px 44px; }
+.ck { margin: 6px 0; font-family: var(--hand); font-size: 18px; font-weight: 700; line-height: 1.2; }
+.ck.ok { color: var(--mint); }
+.ck.warn { color: var(--amber); }
+.ck.bad { color: var(--pen); }
+.ck.size { color: var(--ink3); font-weight: 400; font-size: 16px; }
+button.btnCam { font: inherit; font-family: var(--display); font-weight: 600; color: var(--ink); }
+.row.scan.out .sIc { background: var(--hlSoft); }
+.obLine { color: var(--amber); font-weight: 600; }
+
+/* ---------- live camera ---------- */
+.cam { position: fixed; inset: 0; z-index: 90; background: #000; color: #fff; animation: camIn .25s ease; touch-action: none; }
+.cam.out { animation: camOut .25s ease forwards; }
+@keyframes camIn { from { opacity: 0; transform: scale(1.03); } }
+@keyframes camOut { to { opacity: 0; } }
+.cam video, .camDraw { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.camDraw { pointer-events: none; }
+.camFlash { position: absolute; inset: 0; background: #fff; opacity: 0; pointer-events: none; }
+.camFlash.go { animation: camFlash .45s ease-out; }
+@keyframes camFlash { 0% { opacity: .85; } 100% { opacity: 0; } }
+.camTop { position: absolute; left: 0; right: 0; top: 0; padding: calc(12px + var(--safeT)) 14px 12px; display: flex; align-items: center; gap: 10px; background: linear-gradient(rgba(0,0,0,.55), transparent); }
+.camX, .camTorch { width: 44px; height: 44px; border-radius: 50%; border: 2px solid rgba(255,255,255,.8); background: rgba(0,0,0,.35); color: #fff; font-size: 24px; line-height: 1; display: grid; place-items: center; }
+.camTorch { margin-left: auto; font-size: 20px; }
+.camTorch.on { background: var(--hl); color: var(--ink); border-color: var(--hl); }
+.camCount { margin-left: auto; font-family: var(--display); font-weight: 600; font-size: 16px; padding: 4px 12px; border-radius: 999px; background: rgba(0,0,0,.4); }
+.camCount:empty { display: none; }
+.camTorch:not(.hidden) ~ .camCount, .camCount + .camTorch { margin-left: 0; }
+.camMsg { position: absolute; left: 16px; right: 16px; top: calc(76px + var(--safeT)); margin: 0 auto; max-width: 420px; padding: 12px 16px; border-radius: 16px; text-align: center;
+  background: var(--paper); color: var(--ink); border: 2px solid var(--ink); box-shadow: 4px 4px 0 rgba(0,0,0,.5); transform: rotate(-1deg); transition: background .2s; }
+.camMsg b { display: block; font-family: var(--display); font-size: 19px; font-weight: 600; }
+.camMsg small { display: block; font-family: var(--hand); font-size: 17px; color: var(--ink2); line-height: 1.2; margin-top: 2px; }
+.camMsg.good { background: #D8F5EA; }
+.camMsg.warn { background: #FFF1C9; }
+.camMsg.bad { background: #FFE0E1; }
+.camBottom { position: absolute; left: 0; right: 0; bottom: 0; padding: 18px 20px calc(22px + var(--safeB)); display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 12px; background: linear-gradient(transparent, rgba(0,0,0,.6)); }
+.camHint { font-family: var(--hand); font-size: 15px; line-height: 1.15; color: rgba(255,255,255,.85); }
+.camShutter { position: relative; width: 80px; height: 80px; border: 0; padding: 0; background: none; }
+.camShutter svg { position: absolute; inset: 0; transform: rotate(-90deg); }
+.camShutter circle { fill: none; stroke-width: 6; }
+.camShutter .ringBg { stroke: rgba(255,255,255,.85); }
+.camShutter .ring { stroke: var(--hl); stroke-dasharray: 213.6; stroke-dashoffset: 213.6; stroke-linecap: round; transition: stroke-dashoffset .17s linear; }
+.camShutter i { position: absolute; inset: 12px; border-radius: 50%; background: #fff; transition: transform .1s; }
+.camShutter:active i { transform: scale(.88); }
+.camDone { justify-self: end; padding: 10px 18px; border-radius: 999px; border: 2px solid var(--ink); background: var(--hl); color: var(--ink); font-family: var(--display); font-weight: 600; font-size: 16px; box-shadow: 3px 3px 0 rgba(0,0,0,.5); }

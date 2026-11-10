@@ -89,6 +89,10 @@
     if (!S.key) { line.textContent = ''; return; }
     line.innerHTML = !S.online ? '<i class="dot off"></i>Offline: showing the last copy'
       : `<i class="dot"></i>${S.dataAt ? `Updated ${esc(ago(S.dataAt))}` : esc(S.name || 'Your household')}${S.me ? `, on ${esc(S.me)}` : ''}`;
+    if (typeof OB !== 'undefined' && OB.length) {
+      const n = `${OB.length} scan${OB.length > 1 ? 's' : ''}`;
+      line.innerHTML = !S.online ? `<i class="dot off"></i><span class="obLine">Offline: ${n} waiting to send</span>` : `<i class="dot"></i><span class="obLine">Sending ${n}…</span>`;
+    }
     const n = todoSheets().length;
     $('#todoBadge').textContent = n ? (n > 99 ? '99+' : n) : '';
   }
@@ -147,7 +151,7 @@
         <button data-go="graded"><b>${week.length}</b><span>graded this week</span></button>
         <button data-go="kids"><b>${avg == null ? '–' : avg + '%'}</b><span>average, last 30 days</span></button>
       </div>
-      ${live.length ? `<h2>Scans</h2><div class="list paper">${live.map(scanRow).join('')}</div>` : ''}
+      ${live.length || OB.length ? `<h2>Scans</h2><div class="list paper">${OB.map(outRow).join('')}${live.map(scanRow).join('')}</div>` : ''}
       <h2>Children</h2>
       ${d.students.length ? `<div class="kidCards">${d.students.map(kidCard).join('')}</div>` : '<p class="empty">Add students in Worksheet Studio on the Mac and they appear here.</p>'}
       <button class="bigScan" data-go="scan"><img src="icons/icon-192.png" alt=""><span><b>Scan a finished worksheet</b><small>Your Mac grades it and the result shows up here.</small></span></button>
@@ -274,117 +278,211 @@
   function closeSheet() { $('#sheet').classList.remove('open'); setTimeout(() => $('#sheet').classList.add('hidden'), 250); }
 
   // ---------------- scan ----------------
-  const SC = { pages: [], sheetKey: null, picked: false, busy: false };
+  // Pages are cleaned up on the phone as soon as they're taken (straightened, cropped, shadows evened,
+  // shrunk) and checked (blur, light, which worksheet and page). Sending puts them in the outbox,
+  // which uploads by itself whenever there's a connection.
+  const SC = { pages: [], sheetKey: null, picked: false, busy: false, seq: 0 };
   let db = null;
-  const idb = () => db || (db = new Promise((ok, no) => { const r = indexedDB.open('ws-app', 1); r.onupgradeneeded = () => r.result.createObjectStore('p'); r.onsuccess = () => ok(r.result); r.onerror = () => no(r.error); }));
-  async function saveDraft() { try { const d = await idb(); d.transaction('p', 'readwrite').objectStore('p').put({ sheetKey: SC.sheetKey, picked: SC.picked, pages: SC.pages.map(p => ({ blob: p.blob, id: p.id })) }, 'draft'); } catch (_) { /* no storage */ } }
+  const idb = () => db || (db = new Promise((ok, no) => { const r = indexedDB.open('ws-app', 1); r.onupgradeneeded = () => { if (!r.result.objectStoreNames.contains('p')) r.result.createObjectStore('p'); }; r.onsuccess = () => ok(r.result); r.onerror = () => no(r.error); }));
+  const KEEP = ['blob', 'id', 'code', 'page', 'of', 'sheet', 'how', 'issues', 'foreign', 'bytesIn', 'bytesOut', 'seq'];
+  async function saveDraft() {
+    try { const d = await idb(); d.transaction('p', 'readwrite').objectStore('p').put({ v: 2, sheetKey: SC.sheetKey, picked: SC.picked, pages: SC.pages.filter(p => p.blob).map(p => Object.fromEntries(KEEP.map(k => [k, p[k]]))) }, 'draft'); } catch (_) { /* no storage */ }
+  }
   async function loadDraft() {
     try {
       const d = await idb();
       const v = await new Promise(ok => { const q = d.transaction('p').objectStore('p').get('draft'); q.onsuccess = () => ok(q.result); q.onerror = () => ok(null); });
-      if (v && v.pages && v.pages.length) {
-        SC.sheetKey = v.sheetKey; SC.picked = v.picked;
-        SC.pages = v.pages.map(p => ({ blob: p.blob, url: URL.createObjectURL(p.blob), id: p.id }));
-        SC.pages.forEach(identify);
-      }
+      if (!v || !v.pages || !v.pages.length) return;
+      SC.sheetKey = v.sheetKey; SC.picked = v.picked;
+      if (v.v === 2) { SC.pages = v.pages.map(p => Object.assign({}, p, { url: URL.createObjectURL(p.blob) })); SC.seq = Math.max(0, ...SC.pages.map(p => p.seq || 0)) + 1; }
+      else for (const p of v.pages) await addPage(p.blob); // pages saved by an older version: clean them up now
     } catch (_) { /* fine */ }
   }
-  function clearDraft() { SC.pages.forEach(p => URL.revokeObjectURL(p.url)); SC.pages = []; SC.sheetKey = null; SC.picked = false; idb().then(d => d.transaction('p', 'readwrite').objectStore('p').delete('draft')).catch(() => {}); }
+  function clearDraft() { SC.pages.forEach(p => p.url && URL.revokeObjectURL(p.url)); SC.pages = []; SC.sheetKey = null; SC.picked = false; idb().then(d => d.transaction('p', 'readwrite').objectStore('p').delete('draft')).catch(() => {}); }
 
-  function shrink(file) {
-    return new Promise((ok, no) => {
-      const u = URL.createObjectURL(file), i = new Image();
-      i.onload = () => {
-        const m = 2000, s = Math.min(1, m / Math.max(i.width, i.height));
-        const c = document.createElement('canvas'); c.width = Math.round(i.width * s); c.height = Math.round(i.height * s);
-        const x = c.getContext('2d'); x.fillStyle = '#fff'; x.fillRect(0, 0, c.width, c.height); x.drawImage(i, 0, 0, c.width, c.height);
-        URL.revokeObjectURL(u);
-        c.toBlob(b => b ? ok(b) : no(new Error('Could not read that photo')), 'image/jpeg', 0.86);
-      };
-      i.onerror = () => no(new Error('Could not read that photo')); i.src = u;
-    });
+  // What the Mac printed: code on the page -> which worksheet, paper size, number of pages.
+  function registry() {
+    const d = D(), out = {};
+    for (const [code, v] of Object.entries(d.smart || {})) {
+      const sh = d.sheets.find(x => x.k === v.k);
+      out[code] = Object.assign({}, v, { title: sh ? `${sh.tp || sh.t}${sh.sn ? ' for ' + first(sh.sn) : ''}` : '' });
+    }
+    return out;
   }
-  const b64 = (blob) => new Promise((ok) => { const r = new FileReader(); r.onload = () => ok(String(r.result).split(',')[1]); r.readAsDataURL(blob); });
-  // Smart worksheets: read the code printed on the page to know which worksheet and page this is.
-  async function identify(p) {
-    if (!window.SmartScan || !D().smart) return;
-    p.checking = true; renderScanSoon();
+  const order = (p) => (p.page != null ? p.page : 100 + (p.seq || 0));
+  const sortPages = () => SC.pages.sort((a, b) => order(a) - order(b));
+
+  /** Clean up one photo (a Blob from the gallery/camera app, or a canvas/Blob from the live camera) and add it. */
+  async function addPage(src) {
+    if (SC.pages.length >= 6) { toast('Up to 6 pages per worksheet.'); return { ok: false, message: 'That’s 6 pages already', detail: 'Send these first.' }; }
+    const p = { id: Math.random().toString(36).slice(2), checking: true, url: '', seq: SC.seq++, issues: [] };
+    SC.pages.push(p); renderScanSoon();
     try {
-      const smart = D().smart;
-      const [r] = await SmartScan.analyze([await b64(p.blob)], (code) => smart[code] && smart[code].paper);
-      p.checking = false;
-      if (r && r.ok && smart[r.code]) {
-        p.code = r.code; p.page = r.page; p.of = smart[r.code].pages; p.sheet = smart[r.code].k;
-        if (!SC.sheetKey || !SC.picked) SC.sheetKey = p.sheet;
-      } else p.unknown = true;
-    } catch (_) { p.checking = false; p.unknown = true; }
-    renderScanSoon();
+      const reg = registry();
+      const r = await Pages.process(src, reg);
+      Object.assign(p, { blob: r.blob, url: URL.createObjectURL(r.blob), how: r.how, issues: r.issues, bytesIn: r.bytesIn || 0, bytesOut: r.bytesOut, checking: false });
+      if (r.code != null) {
+        p.code = r.code; p.page = r.page;
+        const info = reg[r.code];
+        if (info) { p.of = info.pages; p.sheet = info.k; if (!SC.sheetKey || !SC.picked) SC.sheetKey = p.sheet; }
+        else p.foreign = true;
+      }
+      sortPages(); saveDraft(); renderScanSoon();
+      return { ok: true, page: p };
+    } catch (e) {
+      SC.pages.splice(SC.pages.indexOf(p), 1); renderScanSoon();
+      return { ok: false, message: e.message || 'Couldn’t use that photo' };
+    }
   }
-  let rsT = null; const renderScanSoon = () => { clearTimeout(rsT); rsT = setTimeout(() => { if (S.tab === 'scan') renderScan(); }, 30); };
-  function renderScan() {
+  async function addFiles(files) {
+    for (const f of Array.from(files || [])) { const r = await addPage(f); if (!r.ok) { toast(r.message); break; } }
+  }
+  const hasPage = (code, page) => SC.pages.some(p => p.code === code && p.page === page);
+
+  // ----- live camera -----
+  function openCamera(retakeId) {
+    if (retakeId) { const i = SC.pages.findIndex(p => p.id === retakeId); if (i >= 0) { const p = SC.pages.splice(i, 1)[0]; if (p.url) URL.revokeObjectURL(p.url); saveDraft(); renderScan(); } }
+    const fallback = (why) => { if (why) toast(why, 5000); const i = $('#cam'); if (i) i.click(); };
+    if (!window.Camera || !Camera.supported()) return fallback();
+    Camera.open({
+      registry: registry(),
+      expectSheet: () => (SC.pages.some(p => p.sheet) || SC.picked ? SC.sheetKey : null),
+      has: hasPage,
+      count: () => SC.pages.filter(p => p.blob).length,
+      onCapture: async (shot) => {
+        const r = await addPage(shot);
+        if (!r.ok) return r;
+        const p = r.page, bad = p.issues.map(k => Pages.ISSUE_TEXT[k][0].toLowerCase());
+        if (p.code != null && p.sheet) {
+          const info = registry()[p.code], need = Array.from({ length: info.pages }, (_, i) => i).filter(i => !hasPage(p.code, i));
+          return { ok: true, warn: bad.length > 0, message: `Page ${p.page + 1}${info.pages > 1 ? ' of ' + info.pages : ''} ✓${bad.length ? ', but ' + bad.join(' and ') : ''}`,
+            detail: bad.length ? 'You can retake it from the list.' : need.length ? `Now page ${need[0] + 1}.` : 'All pages done!', allDone: !need.length && !bad.length };
+        }
+        return { ok: true, warn: bad.length > 0, message: bad.length ? `Saved, but ${bad.join(' and ')}` : 'Photo saved ✓', detail: bad.length ? 'Retake it from the list if the writing is hard to read.' : 'Take the next page, or tap Done.' };
+      },
+      onClose: () => { if (S.tab === 'scan') renderScan(); },
+    }).catch((e) => fallback(e.message === 'blocked' ? 'Camera access is blocked for this app, so the phone’s camera app opens instead.' : 'The camera couldn’t start here, so the phone’s camera app opens instead.'));
+  }
+
+  // ----- checks before sending -----
+  function checks() {
     const d = D(), x = d.sheets.find(s => s.k === SC.sheetKey);
-    const n = SC.pages.length;
-    const pagesFrom = (k) => SC.pages.filter(p => p.sheet === k);
-    const mismatch = x && SC.pages.some(p => p.sheet && p.sheet !== x.k);
-    const smartInfo = x && d.smart && Object.values(d.smart).find(v => v.k === x.k);
-    const have = x ? new Set(pagesFrom(x.k).map(p => p.page)) : new Set();
-    const missing = smartInfo && have.size ? Array.from({ length: smartInfo.pages }, (_, i) => i).filter(i => !have.has(i)) : [];
+    const ready = SC.pages.filter(p => p.blob);
+    const hard = [], soft = [], good = [];
+    const info = x && Object.values(registry()).find(v => v.k === x.k);
+    const other = ready.filter(p => p.sheet && x && p.sheet !== x.k);
+    const foreign = ready.filter(p => p.foreign);
+    const seen = new Map(), dups = [];
+    ready.forEach(p => { if (p.code == null) return; const k = p.code + ':' + p.page; if (seen.has(k)) dups.push(p); else seen.set(k, p); });
+    if (other.length) hard.push(`${other.length === 1 ? 'A page' : other.length + ' pages'} from a different worksheet. Remove ${other.length === 1 ? 'it' : 'them'}, or press Change.`);
+    if (foreign.length) hard.push(`${foreign.length === 1 ? 'A page isn’t' : foreign.length + ' pages aren’t'} from your library on the Mac.`);
+    if (dups.length) hard.push(`Page ${dups.map(p => p.page + 1).join(' and ')} is in twice. Remove the extra copy.`);
+    const have = x ? new Set(ready.filter(p => p.sheet === x.k).map(p => p.page)) : new Set();
+    const missing = info && have.size ? Array.from({ length: info.pages }, (_, i) => i).filter(i => !have.has(i)) : [];
+    if (missing.length) soft.push(`Page ${missing.map(i => i + 1).join(' and ')} of ${info.pages} is missing.`);
+    else if (info && have.size === info.pages) good.push(`All ${info.pages} page${info.pages > 1 ? 's' : ''} are here${info.pages > 1 ? ', in order' : ''}`);
+    ready.forEach((p, i) => p.issues.forEach(k => soft.push(`${p.page != null ? 'Page ' + (p.page + 1) : 'Photo ' + (i + 1)}: ${Pages.ISSUE_TEXT[k][1]}`)));
+    if (ready.length && ready.every(p => !p.issues.length)) good.push('Sharp and well lit');
+    if (ready.some(p => p.how === 'smart' || p.how === 'edges')) good.push('Straightened and cropped');
+    return { x, hard, soft, good, missing, dups: new Set(dups.map(p => p.id)), other: new Set(other.map(p => p.id)), foreign: new Set(foreign.map(p => p.id)) };
+  }
+
+  let rsT = null; const renderScanSoon = () => { clearTimeout(rsT); rsT = setTimeout(() => { if (S.tab === 'scan') renderScan(); }, 30); };
+  const kb = (n) => (n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(n / 1024)) + ' KB');
+  function renderScan() {
+    const c = checks(), x = c.x;
+    const n = SC.pages.length, busy = SC.pages.some(p => p.checking);
+    const bytesIn = SC.pages.reduce((a, p) => a + (p.bytesIn || 0), 0), bytesOut = SC.pages.reduce((a, p) => a + (p.bytesOut || 0), 0);
+    const tileFlag = (p) => c.other.has(p.id) ? ['bad', 'Other worksheet'] : c.foreign.has(p.id) ? ['bad', 'Not yours'] : c.dups.has(p.id) ? ['bad', 'In twice']
+      : p.issues.length ? ['warn', Pages.ISSUE_TEXT[p.issues[0]][0]] : null;
     $('#view').innerHTML = `<section class="scanV">
       <h1 class="pageT"><span>Scan a worksheet</span></h1>
       <div class="which ${x ? 'set' : ''}">
         ${x ? `<span class="sub">${subj(x.s).emoji}</span><span class="rMain"><b>${esc(x.tp || x.t)}</b><small>${esc(x.sn ? first(x.sn) : 'Anyone')}${x.n > 1 ? `, sheet ${x.i + 1} of ${x.n}` : ''}${SC.pages.some(p => p.sheet === x.k) ? ', recognised from the page ✓' : ''}</small></span><button class="link" data-act="pick">Change</button>`
-          : `<span class="sub">❓</span><span class="rMain"><b>Which worksheet?</b><small>${n ? (SC.pages.some(p => p.checking) ? 'Reading the page…' : 'Couldn’t tell from the photo. Pick it from the list.') : 'Take a photo and it’s usually recognised automatically.'}</small></span><button class="link" data-act="pick">Pick</button>`}
+          : `<span class="sub">❓</span><span class="rMain"><b>Which worksheet?</b><small>${n ? (busy ? 'Reading the page…' : 'Couldn’t tell from the photo. Pick it from the list.') : 'Smart worksheets are recognised from the page.'}</small></span><button class="link" data-act="pick">Pick</button>`}
       </div>
-      ${mismatch ? '<p class="warn">Some pages belong to a different worksheet. Remove them, or press Change.</p>' : ''}
-      ${missing.length ? `<p class="warn soft">Page ${missing.map(i => i + 1).join(' and ')} of ${smartInfo.pages} still needed.</p>` : ''}
-      <div class="pages">${SC.pages.map((p, k) => `<div class="pg ${p.sheet && x && p.sheet !== x.k ? 'bad' : ''}"><img src="${p.url}" alt="Page ${k + 1}">
-          <span class="pgL">${p.checking ? '<i class="spin sm"></i>' : p.page != null ? `Page ${p.page + 1}${p.of ? ' of ' + p.of : ''}` : `Photo ${k + 1}`}</span>
-          <button data-rm="${k}" aria-label="Remove">×</button></div>`).join('')}
-        ${n < 6 ? `<label class="addTile" for="cam"><span><b>+</b>${n ? 'Add page ' + (n + 1) : 'Take a photo'}</span></label>` : ''}</div>
+      <div class="pages">${SC.pages.map((p, k) => { const f = tileFlag(p); return `<div class="pg ${f ? f[0] : ''}">
+          ${p.url ? `<img src="${p.url}" alt="Page ${k + 1}">` : '<span class="pgWait"><i class="spin"></i><small>Cleaning up…</small></span>'}
+          <span class="pgL">${p.checking ? 'Checking…' : p.page != null ? `Page ${p.page + 1}${p.of ? ' of ' + p.of : ''}` : `Photo ${k + 1}`}</span>
+          ${f ? `<span class="pgFlag ${f[0]}">${esc(f[1])}</span>` : ''}
+          ${f && f[0] === 'warn' ? `<button class="pgRetake" data-retake="${p.id}">Retake</button>` : ''}
+          ${p.checking ? '' : `<button class="pgX" data-rm="${k}" aria-label="Remove">×</button>`}</div>`; }).join('')}
+        ${n < 6 ? `<button class="addTile" data-act="camera"><span><b>+</b>${n ? 'Add page ' + (n + 1) : 'Scan the first page'}</span></button>` : ''}</div>
+      ${n && !busy ? `<div class="checkList paper">
+          ${c.hard.map(t => `<p class="ck bad">✗ ${esc(t)}</p>`).join('')}
+          ${c.soft.map(t => `<p class="ck warn">! ${esc(t)}</p>`).join('')}
+          ${c.good.map(t => `<p class="ck ok">✓ ${esc(t)}</p>`).join('')}
+          ${bytesIn > bytesOut * 1.3 ? `<p class="ck size">Shrunk on the phone from ${kb(bytesIn)} to ${kb(bytesOut)}</p>` : ''}
+        </div>` : ''}
       <input id="cam" type="file" accept="image/*" capture="environment" hidden>
       <input id="lib" type="file" accept="image/*" multiple hidden>
       <div class="scanBtns">
-        <label class="btnCam" for="cam">📷 ${n ? 'Take another photo' : 'Take a photo'}</label>
+        <button class="btnCam" data-act="camera">📷 ${n ? 'Scan more pages' : 'Scan pages'}</button>
         <label class="btnLib" for="lib">🖼️ From gallery</label>
       </div>
-      <button class="primary wide" data-act="send" ${!n || !x || mismatch || SC.busy || SC.pages.some(p => p.checking) ? 'disabled' : ''}>${SC.busy ? '<i class="spin sm"></i> Sending…' : `Send ${n || ''} page${n === 1 ? '' : 's'} to the Mac`}</button>
+      <button class="primary wide" data-act="send" ${!n || !x || busy || c.hard.length ? 'disabled' : ''}>${navigator.onLine ? `Send ${n || ''} page${n === 1 ? '' : 's'} to the Mac` : `Save ${n || ''} page${n === 1 ? '' : 's'} to send later`}</button>
       ${n ? '<button class="ghost wide" data-act="clear">Start over</button>' : ''}
-      <ul class="tips"><li>Lay it flat, in good light</li><li>Keep all four corner squares in the photo</li><li>One photo per page</li></ul>
+      <ul class="tips"><li>Smart worksheets are taken by themselves when all four corner squares are in view</li><li>Lay it flat, in good light</li><li>No internet? Scans wait on the phone and send themselves later</li></ul>
     </section>`;
     $('#cam').onchange = (e) => { addFiles(e.target.files); e.target.value = ''; };
     $('#lib').onchange = (e) => { addFiles(e.target.files); e.target.value = ''; };
-  }
-  async function addFiles(files) {
-    for (const f of Array.from(files || [])) {
-      if (SC.pages.length >= 6) { toast('Up to 6 pages per worksheet.'); break; }
-      try { const blob = await shrink(f); const p = { blob, url: URL.createObjectURL(blob), id: Math.random().toString(36).slice(2) }; SC.pages.push(p); identify(p); }
-      catch (e) { toast(e.message); }
-    }
-    saveDraft(); renderScan();
   }
   function pickSheet() {
     const list = D().sheets.filter(x => !x.arch && x.status !== 'graded').sort((a, b) => (a.status === 'printed' ? 0 : 1) - (b.status === 'printed' ? 0 : 1) || (b.made || '').localeCompare(a.made || ''));
     openSheet(`<h2>Which worksheet is this?</h2><div class="list paper pickList">${list.slice(0, 80).map(sheetRow).join('') || '<p class="empty">No worksheets are waiting to be graded.</p>'}</div><button class="ghost wide" data-close>Cancel</button>`);
     $('#sheetPanel').dataset.picking = '1';
   }
-  async function send() {
-    const x = D().sheets.find(s => s.k === SC.sheetKey);
-    if (!x || !SC.pages.length || SC.busy) return;
-    SC.busy = true; renderScan();
+  async function send(anyway) {
+    const c = checks(), x = c.x;
+    if (!x || !SC.pages.length || SC.busy || c.hard.length || SC.pages.some(p => p.checking)) return;
+    if (c.soft.length && !anyway) {
+      return openSheet(`<h2>Before you send</h2><div class="checkList paper">${c.soft.map(t => `<p class="ck warn">! ${esc(t)}</p>`).join('')}</div>
+        <p class="me">The Mac can still try, but answers on these pages may be misread.</p>
+        <button class="primary wide" data-close>Go back and fix it</button><button class="ghost wide" data-act="sendAnyway">Send anyway</button>`);
+    }
+    SC.busy = true;
     try {
-      // Pages in order: recognised page numbers first, then the rest in the order they were taken.
-      const pages = SC.pages.slice().sort((a, b) => (a.page == null ? 99 : a.page) - (b.page == null ? 99 : b.page));
-      const token = await rpc('hh_scan_start', { p_key: S.key, p_sheet_key: x.k, p_title: x.tp || x.t, p_student: x.sn || '' });
-      for (let k = 0; k < pages.length; k++) {
-        const r = await fetch(`${SB}/storage/v1/object/scans/${token}/${k + 1}.jpg`, { method: 'POST', headers: { apikey: PK, Authorization: `Bearer ${PK}`, 'Content-Type': 'image/jpeg', 'x-upsert': 'false' }, body: pages[k].blob });
-        if (!r.ok) throw new Error(`Page ${k + 1} didn’t upload (${r.status})`);
-      }
-      if (!(await rpc('mark_phone_uploaded', { p_token: token, p_pages: pages.length }))) throw new Error('The upload was not accepted');
-      S.scans.unshift({ token, sheet_key: x.k, title: x.tp || x.t, student: x.sn || '', state: 'received', created_at: new Date().toISOString() });
-      clearDraft(); SC.busy = false;
-      toast('Sent! Your Mac will grade it.', 3500, true);
-      go('home');
-    } catch (e) { SC.busy = false; renderScan(); toast(e.message + '. Check the connection and try again.', 6000); }
+      await Outbox.add({ key: S.key, sheetKey: x.k, title: x.tp || x.t, student: x.sn || '', pages: SC.pages.map(p => p.blob) });
+    } catch (e) { SC.busy = false; return toast('Couldn’t save the scan on this phone. Free up some space and try again.', 6000); }
+    clearDraft(); SC.busy = false;
+    toast(navigator.onLine ? 'Sending to your Mac…' : 'Saved on this phone. It sends by itself when you’re back online.', 4500, true);
+    go('home');
+    flushOutbox();
+  }
+
+  // ----- outbox -----
+  let OB = [];
+  async function refreshOutbox() {
+    OB = window.Outbox ? await Outbox.list().catch(() => []) : [];
+    renderTop(); if (S.tab === 'home') render();
+  }
+  function onOutbox(ev) {
+    if (ev.type === 'sent') {
+      S.scans.unshift({ token: ev.job.token, sheet_key: ev.job.sheetKey, title: ev.job.title, student: ev.job.student, state: 'received', created_at: new Date().toISOString() });
+      ls.set('ws.scans', S.scans);
+      toast(`Sent “${ev.job.title}”. Your Mac will grade it.`, 3500, true);
+    }
+    refreshOutbox();
+  }
+  let flushing = false;
+  async function flushOutbox() {
+    if (!window.Outbox || flushing) return;
+    flushing = true;
+    try { await refreshOutbox(); if (OB.length && navigator.onLine) await Outbox.flush(onOutbox); } catch (_) { /* tries again later */ }
+    flushing = false;
+    await refreshOutbox();
+  }
+  function outRow(j) {
+    const sending = j.state === 'sending' && navigator.onLine;
+    const st = j.fatal ? ['err', 'Can’t send', 'This phone was unlinked on the Mac. Link it again to send this.']
+      : !navigator.onLine ? ['wait', 'Waiting for internet', 'It sends by itself when the phone is back online.']
+      : sending ? ['busy', `Sending ${Math.min(j.done.length + 1, j.pages.length)} of ${j.pages.length}`, 'Uploading the pages…']
+      : ['wait', 'Will try again', j.error ? j.error : 'Trying again shortly.'];
+    return `<div class="row scan out ${st[0]}" data-out="${esc(j.id)}">
+      <span class="sIc">${st[0] === 'busy' ? '<i class="spin"></i>' : st[0] === 'err' ? '!' : '📤'}</span>
+      <span class="rMain"><b>${esc(j.title || 'Worksheet')}</b><small>${esc(j.student ? first(j.student) + ': ' : '')}${esc(st[2])}</small></span>
+      <span class="rSide"><b class="${st[0]}">${esc(st[1])}</b><small>${j.pages.length} page${j.pages.length > 1 ? 's' : ''}</small></span>
+    </div>`;
   }
 
   // ---------------- events ----------------
@@ -403,7 +501,14 @@
     const at = t.closest('[data-att]'); if (at) return resultDetail(at.dataset.att);
     const er = t.closest('[data-err]'); if (er) { const x = S.scans.find(y => y.token === er.dataset.err); if (x) openSheet(`<h2>${esc(x.title)}</h2><p class="warn">${esc((x.result && x.result.message) || 'It couldn’t be graded.')}</p><button class="primary wide" data-scan-sheet="${esc(x.sheet_key)}">📷 Scan it again</button><button class="ghost wide" data-close>Close</button>`); return; }
     if (t.closest('[data-close]') || t.id === 'sheet') { delete $('#sheetPanel').dataset.picking; return closeSheet(); }
-    const rm = t.closest('[data-rm]'); if (rm) { const p = SC.pages.splice(Number(rm.dataset.rm), 1)[0]; if (p) URL.revokeObjectURL(p.url); if (!SC.picked && !SC.pages.some(q => q.sheet)) SC.sheetKey = null; saveDraft(); return renderScan(); }
+    const rt = t.closest('[data-retake]'); if (rt) return openCamera(rt.dataset.retake);
+    const ob = t.closest('[data-out]');
+    if (ob) {
+      const j = OB.find(y => y.id === ob.dataset.out); if (!j) return;
+      return openSheet(`<h2>${esc(j.title)}</h2><p class="me">${j.pages.length} page${j.pages.length > 1 ? 's are' : ' is'} saved on this phone and ${navigator.onLine ? 'will be sent to the Mac' : 'will be sent when the phone is back online'}.${j.error ? `<br><small>Last try: ${esc(j.error)}</small>` : ''}</p>
+        <button class="primary wide" data-act="outNow" ${navigator.onLine ? '' : 'disabled'}>Send now</button><button class="ghost wide" data-act="outDel" data-id="${esc(j.id)}">Delete this scan</button><button class="ghost wide" data-close>Close</button>`);
+    }
+    const rm = t.closest('[data-rm]'); if (rm) { const p = SC.pages.splice(Number(rm.dataset.rm), 1)[0]; if (p && p.url) URL.revokeObjectURL(p.url); if (!SC.picked && !SC.pages.some(q => q.sheet)) SC.sheetKey = null; saveDraft(); return renderScan(); }
     const a = t.closest('[data-act]'); if (!a) return;
     const act = a.dataset.act;
     if (act === 'pick') return pickSheet();
@@ -418,14 +523,21 @@
       closeSheet(); S.me = ''; ls.set('ws.me', ''); S.key = ''; ls.set('ws.key', ''); S.data = null; ls.set('ws.data', null); return render();
     }
     if (act === 'send') return send();
+    if (act === 'sendAnyway') { closeSheet(); return send(true); }
+    if (act === 'camera') return openCamera();
+    if (act === 'outNow') { closeSheet(); return flushOutbox(); }
+    if (act === 'outDel') { const id = a.dataset.id; if (!confirm('Delete this scan from the phone? It hasn’t reached the Mac yet.')) return; closeSheet(); await Outbox.remove(id); return refreshOutbox(); }
     if (act === 'clear') { clearDraft(); return renderScan(); }
     if (act === 'install' && S.installEvt) { S.installEvt.prompt(); const c = await S.installEvt.userChoice.catch(() => null); S.installEvt = null; render(); if (c && c.outcome === 'accepted') toast('Installed! Open it from your home screen.', 4000, true); }
   });
   $('#refreshBtn').addEventListener('click', () => { $('#refreshBtn').classList.add('turn'); setTimeout(() => $('#refreshBtn').classList.remove('turn'), 700); pull(true); });
   window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); S.installEvt = e; if (S.tab === 'home') render(); });
-  window.addEventListener('online', () => { S.online = true; pull(); });
-  window.addEventListener('offline', () => { S.online = false; renderTop(); });
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) pull(); });
+  window.addEventListener('online', () => { S.online = true; pull(); flushOutbox(); if (S.tab === 'scan') renderScan(); });
+  window.addEventListener('offline', () => { S.online = false; renderTop(); refreshOutbox(); if (S.tab === 'scan') renderScan(); });
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) { pull(); flushOutbox(); } });
+  if (navigator.serviceWorker) navigator.serviceWorker.addEventListener('message', (e) => { if (e.data && e.data.outbox) { if (e.data.outbox === 'sent') { pullScans().then(render).catch(() => {}); } refreshOutbox(); } });
+  // The outbox tries again every 20 s while something is waiting.
+  setInterval(() => { if (OB.length && navigator.onLine && !document.hidden) flushOutbox(); }, 20000);
   window.addEventListener('hashchange', async () => { await tryPair(); render(); });
 
   // Refresh: every 8 s while something is waiting on the Mac, otherwise every 30 s.
@@ -439,8 +551,10 @@
     if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
     await tryPair();
     await loadDraft();
+    await refreshOutbox();
     render();
     if (S.key) pull(true);
+    flushOutbox();
   })();
   window.WSPhone = { S, SC, render };
 })();
