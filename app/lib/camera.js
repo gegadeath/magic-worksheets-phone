@@ -14,7 +14,7 @@
 (function (root) {
   'use strict';
   const $ = (s, r) => (r || document).querySelector(s);
-  const WORK = 480;          // long side of the frame that gets analysed
+  const WORK = 640;          // long side of the frame that gets analysed (the code strip is read from the full frame)
   const TICK = 170;          // ms between looks
   const STEADY = 3;          // steady looks in a row before taking the photo
   const MOVE = 0.012;        // corners may move this share of the frame diagonal and still count as steady
@@ -135,8 +135,23 @@
     wx.drawImage(v, 0, 0, w, h);
     const reg = st.opts.registry || {};
     let hit;
-    try { hit = root.SmartScan.detectFrame(st.work, (c) => reg[c] && reg[c].paper); } catch (_) { hit = { ok: false }; }
+    try { hit = root.SmartScan.detectFrame(st.work, (c) => reg[c] && reg[c].paper, v); } catch (_) { hit = { ok: false }; }
     const q = root.SmartScan.quality(st.work);
+    // A code that isn't in the library has to be seen twice in a row before we say so (one misread
+    // frame shouldn't flash a red warning).
+    if (hit.ok && !reg[hit.code]) {
+      const again = st.lastUnknown === hit.code;
+      st.lastUnknown = hit.code;
+      if (!again) hit = Object.assign({}, hit, { ok: false, squares: true });
+    } else st.lastUnknown = null;
+    if (!hit.ok && hit.squares) {
+      // All four corner squares are in view but the page code isn't readable yet.
+      st.prev = null; st.steady = 0; ring(st, 0); paint(st, hit);
+      const area = polyArea(hit.outline) / (w * h);
+      if (area < 0.22) return say(st, 'Move closer', 'Found the corner squares. Fill more of the screen with the page.');
+      if (q.brightness < 55) return say(st, 'Too dark', 'Tap ⚡ for light, or move somewhere brighter.', 'warn');
+      return say(st, 'Hold still…', 'Found the corner squares. Reading the page code.');
+    }
     if (!hit.ok) {
       st.prev = null; st.steady = 0; ring(st, 0); paint(st, null);
       if (q.brightness < 55) return say(st, 'Too dark', st.track && !$('.camTorch', st.el).classList.contains('hidden') ? 'Tap ⚡ for light, or move somewhere brighter.' : 'Move somewhere brighter.', 'warn');

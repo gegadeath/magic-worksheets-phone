@@ -35,8 +35,10 @@
     // Local-mean threshold (window much larger than a marker) plus an absolute "really dark" test.
     const I = new Float64Array((w + 1) * (h + 1));
     for (let y = 0; y < h; y++) { let row = 0; for (let x = 0; x < w; x++) { row += g[y * w + x]; I[(y + 1) * (w + 1) + x + 1] = I[y * (w + 1) + x + 1] + row; } }
-    const sorted = Float32Array.from(g).sort();
-    const median = sorted[sorted.length >> 1];
+    const hist = new Uint32Array(256);
+    for (let i = 0; i < g.length; i++) hist[g[i] | 0]++;
+    let median = 0;
+    for (let acc = 0; median < 255 && (acc += hist[median]) < g.length / 2; median++);
     const r = Math.max(8, Math.round(Math.min(w, h) / 9));
     const m = new Uint8Array(w * h);
     for (let y = 0; y < h; y++) {
@@ -73,9 +75,22 @@
     return out;
   }
   const quadArea = (pts) => { let a = 0; for (let i = 0; i < pts.length; i++) { const [x1, y1] = pts[i], [x2, y2] = pts[(i + 1) % pts.length]; a += x1 * y2 - x2 * y1; } return Math.abs(a) / 2; };
-  function markerCandidates(bl, w, h) {
+  // A printed corner square is solid ink with clean paper all round it. Wood knots, floor tiles, keyboard
+  // keys and letters mostly fail this, so they can't crowd the real squares out of the search.
+  function surround(G, b) {
+    const cx = b.sx / b.n, cy = b.sy / b.n, side = Math.sqrt(b.n);
+    let black = 0;
+    for (const [dx, dy] of [[-0.3, -0.3], [0.3, -0.3], [0.3, 0.3], [-0.3, 0.3]]) black = Math.max(black, sampleAt(G, cx + dx * side, cy + dy * side));
+    const ring = [];
+    for (let k = 0; k < 12; k++) { const a = k * Math.PI / 6, r = side * (Math.abs(Math.cos(a)) > 0.7 || Math.abs(Math.sin(a)) > 0.7 ? 1.0 : 1.2); ring.push(sampleAt(G, cx + Math.cos(a) * r, cy + Math.sin(a) * r)); }
+    ring.sort((x, y) => x - y);
+    const low = ring[1], mid = ring[6];           // allow one dark sample (a nearby line or the code strip)
+    if (mid - black < 35 || low - black < 0.45 * (mid - black)) return null;
+    return { q: mid - black, hole: (sampleAt(G, cx, cy) - black) / (mid - black) };
+  }
+  function markerCandidates(bl, w, h, G) {
     const md = Math.min(w, h);
-    return bl.filter(b => {
+    const list = bl.filter(b => {
       const bw = b.maxx - b.minx + 1, bh = b.maxy - b.miny + 1;
       if (bw < md * 0.012 || bh < md * 0.012 || bw > md * 0.11 || bh > md * 0.11) return false;
       if (bw / bh > 1.9 || bh / bw > 1.9) return false;
@@ -83,7 +98,8 @@
       const qa = quadArea([b.L, b.T, b.Rt, b.B]);
       const fillBox = b.n / (bw * bh);
       return fillBox > 0.42 && (qa < 4 || b.n / qa > 0.78);
-    }).map(b => ({ x: b.sx / b.n, y: b.sy / b.n, size: Math.sqrt(b.n) }));
+    }).map(b => { const r = G ? surround(G, b) : { q: 1, hole: 0 }; return r && { x: b.sx / b.n, y: b.sy / b.n, size: Math.sqrt(b.n), q: r.q, hole: r.hole }; }).filter(Boolean);
+    return G ? list.sort((a, b) => b.q - a.q).slice(0, 40) : list;
   }
 
   // ---------- homography ----------
@@ -125,12 +141,50 @@
     }
     return n ? s / n : 255;
   }
-  function readStrip(G, H, P) {
+  // Average over a small box (r = half-width in pixels).
+  function sampleBox(G, x, y, r) {
+    if (r <= 1.2) return sampleAt(G, x, y);
+    const R0 = Math.round(r);
+    let s = 0, n = 0;
+    for (let dy = -R0; dy <= R0; dy++) for (let dx = -R0; dx <= R0; dx++) {
+      const X = Math.round(x + dx), Y = Math.round(y + dy);
+      if (X >= 0 && Y >= 0 && X < G.w && Y < G.h) { s += G.g[Y * G.w + X]; n++; }
+    }
+    return n ? s / n : 255;
+  }
+  // hi (optional): { source, scale } — a sharper copy of the same picture (e.g. the live video at full size),
+  // `scale` times bigger than G. The code strip's cells are tiny, so they're read from that when offered.
+  function readStrip(G, H, P, hi, info) {
     const left = (P.w - 32 * S.cell) / 2, cy = S.stripTop + S.cellH / 2;
-    const v = [];
-    for (let i = 0; i < 32; i++) { const [x, y] = apply(H, left + (i + 0.5) * S.cell, cy); v.push(sampleAt(G, x, y)); }
+    const pts = [];
+    for (let i = 0; i < 32; i++) pts.push(apply(H, left + (i + 0.5) * S.cell, cy));
+    let v;
+    const cellPx = Math.hypot(pts[31][0] - pts[0][0], pts[31][1] - pts[0][1]) / 31;
+    if (hi && hi.scale > 1.2 && cellPx < 9) {
+      const k = hi.scale, pad = cellPx * 2;
+      const xs = pts.map(p => p[0]), ys = pts.map(p => p[1]);
+      const x0 = Math.max(0, (Math.min(...xs) - pad) * k), y0 = Math.max(0, (Math.min(...ys) - pad) * k);
+      const x1 = (Math.max(...xs) + pad) * k, y1 = (Math.max(...ys) + pad) * k;
+      const sw = Math.max(1, Math.round(x1 - x0)), sh = Math.max(1, Math.round(y1 - y0));
+      const f = Math.min(1, 1600 / sw);                       // keep the copied strip small
+      const c = document.createElement('canvas'); c.width = Math.max(1, Math.round(sw * f)); c.height = Math.max(1, Math.round(sh * f));
+      try {
+        c.getContext('2d', { willReadFrequently: true }).drawImage(hi.source, x0, y0, sw, sh, 0, 0, c.width, c.height);
+        const Gh = gray(c), m = k * f;
+        v = pts.map(([x, y]) => sampleBox(Gh, (x * k - x0) * f, (y * k - y0) * f, cellPx * m * 0.22));
+      } catch (_) { v = null; }
+    }
+    if (!v) v = pts.map(([x, y]) => sampleBox(G, x, y, cellPx * 0.22));
     const black = (v[0] + v[31]) / 2, white = (v[1] + v[30]) / 2;
     if (white - black < 25) return null;
+    // Blank paper right above and below the strip (a random pattern rarely has that).
+    let clear = 0;
+    for (let i = 0; i < 32; i += 3) for (const dy of [-0.85, 0.85]) {
+      const [x, y] = apply(H, left + (i + 0.5) * S.cell, cy + dy * S.cellH * 1.25);
+      if (sampleAt(G, x, y) > black + 0.6 * (white - black)) clear++;
+    }
+    if (clear < 20) return null;
+    if (info) info.strip = true;                               // the strip is there, even if it can't be read yet
     const t = (black + white) / 2, cells = v.slice(2, 30);
     const id = R.smartDecode(cells.map(x => (x < t ? 1 : 0)));
     if (!id) return null;
@@ -142,46 +196,116 @@
   // and (top-left only) a white hole in the centre? Returns a score; null if any check fails.
   function verify(G, H, P) {
     const c = markerCentres(P), m = S.marker;
-    let score = 0;
+    let score = 0, inkSum = 0, paperSum = 0;
+    const holes = [];
     for (let i = 0; i < 4; i++) {
       const [cx, cy] = c[i];
       const out = [[-0.95, 0], [0.95, 0], [0, -0.95], [0, 0.95]].map(([dx, dy]) => sampleAt(G, ...apply(H, cx + dx * m, cy + dy * m)));
       const ink = [[-0.3, -0.3], [0.3, -0.3], [0.3, 0.3], [-0.3, 0.3]].map(([dx, dy]) => sampleAt(G, ...apply(H, cx + dx * m, cy + dy * m)));
       const white = out.reduce((a, b) => a + b, 0) / 4, black = Math.max(...ink);
-      if (white - black < 30) return null;
-      if (i === 0) { const hole = sampleAt(G, ...apply(H, cx, cy)); if (hole - black < 0.4 * (white - black)) return null; }
-      else { const mid = sampleAt(G, ...apply(H, cx, cy)); if (mid - black > 0.5 * (white - black)) return null; }
+      if (white - black < 24) return null;
+      const mid = sampleAt(G, ...apply(H, cx, cy));
+      holes.push((mid - black) / (white - black));
+      inkSum += black; paperSum += white;
+      if (i > 0 && holes[i] > 0.55) return null;
       score += white - black;
     }
+    // The top-left square has a white hole. In a far or blurry picture it fades to grey, so it only has
+    // to be clearly lighter than the middles of the other three squares.
+    if (holes[0] < 0.4 && holes[0] - Math.max(holes[1], holes[2], holes[3]) < 0.12) return null;
+    // A printed page has blank paper margins running between the squares; a tabletop doesn't.
+    const ink = inkSum / 4, paper = paperSum / 4;             // the squares' black and the paper next to them
+    const [ax, ay] = c[0], [bx] = c[1], [, dy] = c[3];
+    const left = (P.w - 32 * S.cell) / 2 - 6, right = P.w - left;
+    const pts = [];
+    for (let t = 1; t < 10; t++) {
+      const fx = ax + (bx - ax) * t / 10, fy = ay + (dy - ay) * t / 10;
+      if (fx < left || fx > right) pts.push([fx, ay]);       // top edge, skipping the code strip
+      pts.push([fx, dy], [ax, fy], [bx, fy]);                // bottom, left and right edges
+    }
+    let clean = 0;
+    for (const [x, y] of pts) if (sampleAt(G, ...apply(H, x, y)) - ink > 0.6 * (paper - ink)) clean++;
+    if (clean < pts.length * 0.8) return null;
     return score;
   }
 
-  // Try the strongest corner candidates in every rotation and both paper sizes. A match needs the ID
-  // strip to decode AND all four markers to check out; the best-scoring match wins.
-  function locate(G, cands, paperFor) {
+  // Find four candidates that form the page's marker rectangle. Every set of four from the strongest
+  // candidates (plus the ones nearest each corner of the picture) is put in order around its centre and
+  // checked for a plausible shape before the slower pixel checks. A match needs all four markers to
+  // check out AND the ID strip to decode; the best-scoring match wins.
+  function locate(G, cands, paperFor, hi) {
     if (cands.length < 4) return null;
-    const pick = (score) => cands.slice().sort((a, b) => score(a) - score(b)).slice(0, 4);
-    const groups = [pick(c => c.x + c.y), pick(c => -c.x + c.y), pick(c => -c.x - c.y), pick(c => c.x - c.y)]; // photo TL, TR, BR, BL
-    const best = {};
-    for (const a of groups[0]) for (const b of groups[1]) for (const c of groups[2]) for (const d of groups[3]) {
-      const pts = [a, b, c, d];
-      if (new Set(pts).size < 4) continue;
-      const sizes = pts.map(p => p.size), mx = Math.max(...sizes), mn = Math.min(...sizes);
-      if (mx / mn > 3) continue;
-      for (let rot = 0; rot < 4; rot++) {
-        const dst = [0, 1, 2, 3].map(i => [pts[(i + rot) % 4].x, pts[(i + rot) % 4].y]);
-        for (const paper of ['Letter', 'A4']) {
-          const P = PAPERS[paper], H = homography(markerCentres(P), dst);
-          if (!H) continue;
-          const score = verify(G, H, P);
-          if (score === null || (best[paper] && score <= best[paper].score)) continue;
-          const id = readStrip(G, H, P);
-          if (id) best[paper] = { H, paper, P, id, score };
+    const byQ = cands.slice().sort((a, b) => (b.q || 0) - (a.q || 0)).slice(0, 18);
+    const ext = (score) => cands.slice().sort((a, b) => score(a) - score(b)).slice(0, 4);
+    const pool = [...new Set([...byQ, ...ext(c => c.x + c.y), ...ext(c => -c.x + c.y), ...ext(c => -c.x - c.y), ...ext(c => c.x - c.y)])].slice(0, 30);
+    const minArea = G.w * G.h * 0.02;
+    const N = pool.length, hits = [];
+    const okSize = (a, b) => a.size / b.size < 3.2 && b.size / a.size < 3.2;   // near squares look bigger than far ones
+    for (let i = 0; i < N; i++) for (let j = i + 1; j < N; j++) {
+      if (!okSize(pool[i], pool[j])) continue;
+      for (let k = j + 1; k < N; k++) {
+        if (!okSize(pool[i], pool[k]) || !okSize(pool[j], pool[k])) continue;
+        for (let l = k + 1; l < N; l++) {
+          const d = pool[l];
+          if (!okSize(pool[i], d) || !okSize(pool[j], d) || !okSize(pool[k], d)) continue;
+          const four = [pool[i], pool[j], pool[k], d];
+          const cx = (four[0].x + four[1].x + four[2].x + d.x) / 4, cy = (four[0].y + four[1].y + four[2].y + d.y) / 4;
+          for (const p of four) p.ang = Math.atan2(p.y - cy, p.x - cx);
+          const pts = four.sort((a, b) => a.ang - b.ang); // clockwise on screen
+          // convex, big enough, sides roughly in proportion, squares the right size for the rectangle
+          let convex = true;
+          for (let t = 0; t < 4 && convex; t++) {
+            const a = pts[t], b = pts[(t + 1) % 4], c = pts[(t + 2) % 4];
+            if ((b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x) <= 0) convex = false;
+          }
+          if (!convex) continue;
+          // A sheet photographed at any sensible angle keeps its corners roughly square.
+          let square = true;
+          for (let t = 0; t < 4 && square; t++) {
+            const a = pts[(t + 3) % 4], b = pts[t], c = pts[(t + 1) % 4];
+            const ux = a.x - b.x, uy = a.y - b.y, vx = c.x - b.x, vy = c.y - b.y;
+            const cos = (ux * vx + uy * vy) / (Math.hypot(ux, uy) * Math.hypot(vx, vy));
+            if (Math.abs(cos) > 0.574) square = false;            // outside 55°–125°
+          }
+          if (!square) continue;
+          const s0 = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y), s1 = Math.hypot(pts[2].x - pts[1].x, pts[2].y - pts[1].y);
+          const s2 = Math.hypot(pts[3].x - pts[2].x, pts[3].y - pts[2].y), s3 = Math.hypot(pts[0].x - pts[3].x, pts[0].y - pts[3].y);
+          if (s0 / s2 > 2.2 || s2 / s0 > 2.2 || s1 / s3 > 2.2 || s3 / s1 > 2.2) continue;
+          const msz = (pts[0].size + pts[1].size + pts[2].size + pts[3].size) / 4, rel = msz / ((s0 + s1 + s2 + s3) / 4);
+          if (rel < 0.016 || rel > 0.08) continue;
+          if (quadArea(pts.map(p => [p.x, p.y])) < minArea) continue;
+          // The four points are the same whichever way up the page is, so the pixel check runs once, with
+          // the square that has the clearest white hole as top-left. Which way up (and which paper size)
+          // is settled below by reading the code strip, for the best few sets only.
+          const order = [0, 1, 2, 3].sort((a, b) => (pts[b].hole || 0) - (pts[a].hole || 0));
+          const dst = [0, 1, 2, 3].map(t => [pts[(t + order[0]) % 4].x, pts[(t + order[0]) % 4].y]);
+          const H = homography(markerCentres(PAPERS.Letter), dst);
+          const score = H && verify(G, H, PAPERS.Letter);
+          if (score != null) hits.push({ pts: pts.slice(), order, score });
         }
       }
     }
+    if (!hits.length) return null;
+    hits.sort((a, b) => b.score - a.score);
+    const best = {};
+    let shape = null;
+    for (const h of hits.slice(0, 4)) {
+      for (const rot of h.order) {
+        const dst = [0, 1, 2, 3].map(t => [h.pts[(t + rot) % 4].x, h.pts[(t + rot) % 4].y]);
+        for (const paper of ['Letter', 'A4']) {
+          const P = PAPERS[paper], H = homography(markerCentres(P), dst);
+          if (!H) continue;
+          const info = {};
+          const id = readStrip(G, H, P, hi, info);
+          if (!shape && info.strip) shape = { H, P, paper };
+          if (id && (!best[paper] || id.margin > best[paper].id.margin)) best[paper] = { H, paper, P, id, score: h.score };
+        }
+        if (best.Letter || best.A4) break;
+      }
+      if (best.Letter || best.A4) break;
+    }
     const found = Object.values(best);
-    if (!found.length) return null;
+    if (!found.length) return shape ? Object.assign({ geoOnly: true }, shape) : null;
     // Both paper sizes can fit the same four markers; the print record knows which was used.
     const known = found.map(f => ({ f, p: paperFor && paperFor(f.id.code) })).find(x => x.p === x.f.paper);
     return known ? known.f : found.sort((a, b) => b.id.margin - a.id.margin)[0];
@@ -217,9 +341,9 @@
     const full = toCanvas(img, 2400);
     const small = toCanvas(full, 1100);
     const G = gray(small);
-    const cands = markerCandidates(blobs(darkMask(G), G.w, G.h), G.w, G.h);
-    const hit = locate(G, cands, paperFor);
-    if (!hit) return { ok: false };
+    const cands = markerCandidates(blobs(darkMask(G), G.w, G.h), G.w, G.h, G);
+    const hit = locate(G, cands, paperFor, { source: full, scale: full.width / small.width });
+    if (!hit || hit.geoOnly) return { ok: false };
     const s = full.width / small.width;
     const Hfull = hit.H.slice(); for (let i = 0; i < 3; i++) { Hfull[i] *= s; Hfull[3 + i] *= s; }
     return { ok: true, code: hit.id.code, page: hit.id.page, paper: hit.paper, canvas: warp(full, Hfull, hit.P, 1.6), k: 1.6, P: hit.P };
@@ -234,12 +358,20 @@
 
   /** Find a smart page in one small camera frame (about 640 px wide). Fast enough for several frames a second.
    *  Returns the page's code and page number plus where its four corner squares and outline are in the frame. */
-  function detectFrame(canvas, paperFor) {
+  // source (optional): the same picture at full size (a <video> or canvas), used to read the small code strip.
+  function detectFrame(canvas, paperFor, source) {
     const G = gray(canvas);
-    const cands = markerCandidates(blobs(darkMask(G), G.w, G.h), G.w, G.h);
-    const hit = locate(G, cands, paperFor);
+    const cands = markerCandidates(blobs(darkMask(G), G.w, G.h), G.w, G.h, G);
+    const sw = source ? (source.videoWidth || source.width) : 0;
+    const hit = locate(G, cands, paperFor, sw ? { source, scale: sw / canvas.width } : null);
     if (!hit) return { ok: false };
     const P = hit.P;
+    const where = {
+      corners: markerCentres(P).map(([x, y]) => apply(hit.H, x, y)),
+      outline: [[0, 0], [P.w, 0], [P.w, P.h], [0, P.h]].map(([x, y]) => apply(hit.H, x, y)),
+    };
+    // Four squares found but the code strip couldn't be read yet (too far, blurry or moving).
+    if (hit.geoOnly) return Object.assign({ ok: false, squares: true }, where);
     return {
       ok: true, code: hit.id.code, page: hit.id.page, paper: hit.paper, H: hit.H, P,
       corners: markerCentres(P).map(([x, y]) => apply(hit.H, x, y)),
@@ -251,8 +383,8 @@
   function analyzeCanvas(full, paperFor, k) {
     const small = toCanvas(full, 1100);
     const G = gray(small);
-    const hit = locate(G, markerCandidates(blobs(darkMask(G), G.w, G.h), G.w, G.h), paperFor);
-    if (!hit) return { ok: false };
+    const hit = locate(G, markerCandidates(blobs(darkMask(G), G.w, G.h), G.w, G.h, G), paperFor, { source: full, scale: full.width / small.width });
+    if (!hit || hit.geoOnly) return { ok: false };
     const s = full.width / small.width;
     const Hf = hit.H.slice(); for (let i = 0; i < 3; i++) { Hf[i] *= s; Hf[3 + i] *= s; }
     const kk = k || 1.6;
@@ -370,6 +502,56 @@
     return Hm ? warp(full, Hm, { w: ow, h: oh }, 1) : null;
   }
 
+  // ---------- which answer boxes have handwriting ----------
+  // Sliding max / min over a (2r+1) square, done as two 1-D passes.
+  function slide(g, w, h, r, pickMax) {
+    const tmp = new Float32Array(w * h), out = new Float32Array(w * h);
+    const f = pickMax ? Math.max : Math.min;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      let v = g[y * w + x];
+      for (let d = 1; d <= r; d++) { if (x - d >= 0) v = f(v, g[y * w + x - d]); if (x + d < w) v = f(v, g[y * w + x + d]); }
+      tmp[y * w + x] = v;
+    }
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      let v = tmp[y * w + x];
+      for (let d = 1; d <= r; d++) { if (y - d >= 0) v = f(v, tmp[(y - d) * w + x]); if (y + d < h) v = f(v, tmp[(y + d) * w + x]); }
+      out[y * w + x] = v;
+    }
+    return out;
+  }
+  /** Compare each question's area on the straightened scan with the same area on a blank copy of the page.
+   *  Counts the pixels that are clearly darker than anything printed there: the student's own marks.
+   *  blanks: { [pageNumber]: image or canvas of the blank page }. Returns { [q]: { ink, area } } in page pixels
+   *  (1 px = 1/96 inch). Shadows are evened out first; printed text is allowed to be a few pixels out of place. */
+  function inkCheck(found, layout, blanks, opt) {
+    const DIFF = (opt && opt.diff) || 18, CUT = (opt && opt.cut) || 235;
+    const out = {};
+    for (const f of found) {
+      const pg = layout.pages.find(p => p.n === f.page), B = blanks && blanks[f.page];
+      if (!pg || !B) continue;
+      const P = f.P, W = Math.round(P.w), H = Math.round(P.h);
+      const draw = (src) => { const c = document.createElement('canvas'); c.width = W; c.height = H; const x = c.getContext('2d', { willReadFrequently: true }); x.fillStyle = '#fff'; x.fillRect(0, 0, W, H); x.drawImage(src, 0, 0, W, H); return gray(c).g; };
+      const scan = draw(f.canvas), blank = draw(B);
+      const paper = slide(scan, W, H, 9, true);           // local paper brightness (evens out shadows)
+      const printed = slide(blank, W, H, 3, false);       // printed ink, grown by 3 px to allow for small misalignment
+      const c0 = S.inset + S.marker / 2, fw = P.w - 2 * c0, fh = P.h - 2 * c0;
+      for (const it of pg.items) {
+        const x0 = Math.max(0, Math.floor(c0 + it.x * fw) - 2), y0 = Math.max(0, Math.floor(c0 + it.y * fh) - 2);
+        const x1 = Math.min(W, Math.ceil(c0 + (it.x + it.w) * fw) + 2), y1 = Math.min(H, Math.ceil(c0 + (it.y + it.h) * fh) + 2);
+        let ink = 0;
+        for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) {
+          const i = y * W + x, v = Math.min(255, scan[i] * 255 / Math.max(40, paper[i]));
+          if (v < CUT && v < printed[i] - DIFF) ink++;
+        }
+        out[it.q] = { ink, area: (x1 - x0) * (y1 - y0) };
+      }
+    }
+    return out;
+  }
+  // Fewer marks than this (in 1/96-inch pixels) means nothing was written: a single small digit in light
+  // pencil leaves about 100; an empty box on a phone photo usually 0, rarely more than 20.
+  const INK_EMPTY = 25;
+
   /** Cut each question's area out of the straightened pages and stack them, labelled, into a few tall
    *  images for the AI. layout.pages[n].items = [{ q, x, y, w, h }] in fractions of the marker frame. */
   function answerBoards(found, layout) {
@@ -414,5 +596,5 @@
     return { boards, questions: pieces.map(p => p.q) };
   }
 
-  root.SmartScan = { analyze, answerBoards, detectFrame, analyzeCanvas, quality, evenLight, flattenDocument, toCanvas, _internal: { darkMask, blobs, markerCandidates, homography, apply, locate, gray, readStrip } };
+  root.SmartScan = { analyze, answerBoards, inkCheck, INK_EMPTY, detectFrame, analyzeCanvas, quality, evenLight, flattenDocument, toCanvas, _internal: { darkMask, blobs, markerCandidates, homography, apply, locate, gray, readStrip, verify, markerCentres, surround } };
 })(typeof self !== 'undefined' ? self : this);
