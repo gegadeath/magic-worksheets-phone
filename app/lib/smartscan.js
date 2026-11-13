@@ -597,7 +597,42 @@
 
   /** Cut each question's area out of the straightened pages and stack them, labelled, into a few tall
    *  images for the AI. layout.pages[n].items = [{ q, x, y, w, h }] in fractions of the marker frame. */
-  function answerBoards(found, layout) {
+  // Make handwriting stand out: even out shadows, darken pencil, and (with a blank copy of the page)
+  // fade the printed text so the student's own marks are the darkest thing in the box.
+  function enhance(src, sx, sy, sw, sh, blank, k) {
+    const c = document.createElement('canvas'); c.width = Math.max(1, Math.round(sw)); c.height = Math.max(1, Math.round(sh));
+    const x = c.getContext('2d', { willReadFrequently: true });
+    x.drawImage(src, sx, sy, sw, sh, 0, 0, c.width, c.height);
+    const W = c.width, H = c.height, img = x.getImageData(0, 0, W, H), d = img.data;
+    const g = new Float32Array(W * H);
+    for (let i = 0, j = 0; i < g.length; i++, j += 4) g[i] = 0.299 * d[j] + 0.587 * d[j + 1] + 0.114 * d[j + 2];
+    const paper = slide(g, W, H, Math.max(6, Math.round(W / 60)), true);
+    let printed = null;
+    if (blank) {
+      const b = document.createElement('canvas'); b.width = W; b.height = H;
+      const bx = b.getContext('2d', { willReadFrequently: true }); bx.fillStyle = '#fff'; bx.fillRect(0, 0, W, H);
+      bx.drawImage(blank, sx / k, sy / k, sw / k, sh / k, 0, 0, W, H);
+      const bd = bx.getImageData(0, 0, W, H).data, bg = new Float32Array(W * H);
+      for (let i = 0, j = 0; i < bg.length; i++, j += 4) bg[i] = 0.299 * bd[j] + 0.587 * bd[j + 1] + 0.114 * bd[j + 2];
+      printed = slide(bg, W, H, Math.max(2, Math.round(k * 2)), false);   // printed ink, grown a little
+    }
+    for (let i = 0, j = 0; i < g.length; i++, j += 4) {
+      let v = Math.min(255, g[i] * 255 / Math.max(40, paper[i]));      // shadows evened out
+      v = 255 * Math.pow(v / 255, 1.8);                                // pencil darker
+      if (printed && printed[i] < 200 && v > printed[i] * 0.8 - 20) v = 255 - (255 - v) * 0.35; // printed text faded
+      // keep colour pens readable: scale the colour with the new brightness
+      const o = 0.299 * d[j] + 0.587 * d[j + 1] + 0.114 * d[j + 2] || 1, f = v / o;
+      d[j] = Math.min(255, d[j] * f); d[j + 1] = Math.min(255, d[j + 1] * f); d[j + 2] = Math.min(255, d[j + 2] * f);
+    }
+    x.putImageData(img, 0, 0);
+    return c;
+  }
+
+  /** Cut each question's area out of the straightened pages and stack them, labelled "Question N", into
+   *  square pictures of 2–3 questions. Vision models shrink every picture to about 900 px, so tall strips
+   *  of many questions made the handwriting too small to read.
+   *  blanks (optional): { [page]: image of the blank page } to fade the printed text. */
+  function answerBoards(found, layout, blanks) {
     const pieces = [];
     for (const f of found) {
       const pg = layout.pages.find(p => p.n === f.page); if (!pg) continue;
@@ -606,31 +641,33 @@
         const pad = 6;
         const x = Math.max(0, (c0 + it.x * fw - pad - 22) * k), y = Math.max(0, (c0 + it.y * fh - pad) * k);
         const w = Math.min(f.canvas.width - x, (it.w * fw + 2 * pad + 22) * k), h = Math.min(f.canvas.height - y, (it.h * fh + 2 * pad) * k);
-        if (w > 4 && h > 4) pieces.push({ q: it.q, src: f.canvas, x, y, w, h });
+        if (w > 4 && h > 4) pieces.push({ q: it.q, src: enhance(f.canvas, x, y, w, h, blanks && blanks[f.page], k), x: 0, y: 0, w, h });
       }
     }
     pieces.sort((a, b) => a.q - b.q);
-    const W = 1100, LABEL = 34, GAP = 14, MAXH = 1900;
+    const W = 896, LABEL = 30, GAP = 10, MAXH = 896;
     const boards = [];
     let cur = [], curH = 0;
     const flush = () => {
       if (!cur.length) return;
-      const c = document.createElement('canvas'); c.width = W; c.height = curH;
-      const g = c.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(0, 0, W, curH);
+      const c = document.createElement('canvas'); c.width = W; c.height = Math.max(curH, 200);
+      const g = c.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(0, 0, W, c.height);
       let y = 0;
       for (const p of cur) {
         g.fillStyle = '#1B2A8A'; g.fillRect(0, y, W, LABEL);
-        g.fillStyle = '#fff'; g.font = 'bold 22px Helvetica, Arial, sans-serif'; g.textBaseline = 'middle';
-        g.fillText(`Question ${p.q}`, 12, y + LABEL / 2);
-        g.drawImage(p.src, p.x, p.y, p.w, p.h, 0, y + LABEL, p.dw, p.dh);
+        g.fillStyle = '#fff'; g.font = 'bold 20px Helvetica, Arial, sans-serif'; g.textBaseline = 'middle';
+        g.fillText(`Question ${p.q}`, 10, y + LABEL / 2);
+        g.drawImage(p.src, 0, 0, p.src.width, p.src.height, 0, y + LABEL, p.dw, p.dh);
         g.strokeStyle = '#1B2A8A'; g.lineWidth = 2; g.strokeRect(1, y + 1, W - 2, LABEL + p.dh - 2);
         y += LABEL + p.dh + GAP;
       }
-      boards.push(c.toDataURL('image/jpeg', 0.9).split(',')[1]);
+      boards.push(c.toDataURL('image/jpeg', 0.92).split(',')[1]);
       cur = []; curH = 0;
     };
     for (const p of pieces) {
-      const sc = Math.min(W / p.w, 1.5); p.dw = Math.round(p.w * sc); p.dh = Math.round(p.h * sc);
+      let sc = Math.min(W / p.w, 2);
+      if (p.h * sc > MAXH - LABEL) sc = (MAXH - LABEL) / p.h;      // a very tall answer box gets a picture of its own
+      p.dw = Math.round(p.w * sc); p.dh = Math.round(p.h * sc);
       const need = LABEL + p.dh + GAP;
       if (curH + need > MAXH && cur.length) flush();
       cur.push(p); curH += need;
