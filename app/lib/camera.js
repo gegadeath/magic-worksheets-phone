@@ -19,6 +19,7 @@
   const STEADY = 3;          // steady looks in a row before taking the photo
   const HOLD_MS = 700;       // keep showing a found page this long through frames where it's lost
   const TRACK_MS = 1500;     // follow a found page from frame to frame for this long after last seeing it
+  const READ_MS = 900;       // how long a page code read earlier is trusted while following the squares
   const MOVE = 0.012;        // corners may move this share of the frame diagonal and still count as steady
 
   let cur = null;
@@ -155,6 +156,10 @@
       paint(st, st.last.hit, st.steady >= STEADY ? 'go' : '');
       return;
     }
+    // Following the squares doesn't tell which page it is. A remembered page code is trusted for a
+    // moment only; after that the code has to be read again (the student may have turned the page).
+    if (hit.ok && !hit.tracked) st.read = now;
+    if (hit.ok && hit.tracked && (!st.read || now - st.read > READ_MS)) hit = Object.assign({}, hit, { ok: false, squares: true });
     const q = root.SmartScan.quality(st.work);
     // A code that isn't in the library has to be seen twice in a row before we say so (one misread
     // frame shouldn't flash a red warning).
@@ -262,7 +267,7 @@
       say(st, 'Couldn’t take the photo', String(e.message || e), 'bad');
     }
     await new Promise(ok => setTimeout(ok, 900));
-    st.busy = false; st.prev = null; ring(st, 0);
+    st.busy = false; st.prev = null; st.read = null; ring(st, 0);
   }
 
   root.Camera = { open, close, supported, isOpen: () => !!cur };
