@@ -285,3 +285,6 @@ button.btnCam { font: inherit; font-family: var(--display); font-weight: 600; co
 .camShutter i { position: absolute; inset: 12px; border-radius: 50%; background: #fff; transition: transform .1s; }
 .camShutter:active i { transform: scale(.88); }
 .camDone { justify-self: end; padding: 10px 18px; border-radius: 999px; border: 2px solid var(--ink); background: var(--hl); color: var(--ink); font-family: var(--display); font-weight: 600; font-size: 16px; box-shadow: 3px 3px 0 rgba(0,0,0,.5); }
+
+.camSave { position: absolute; left: 50%; transform: translateX(-50%); bottom: calc(150px + var(--safeB, 0px)); padding: 9px 16px; border-radius: 999px; border: 1.5px solid rgba(255,255,255,.75); background: rgba(0,0,0,.5); color: #fff; font: 600 14px/1.2 inherit; white-space: nowrap; }
+.camSave.hidden { display: none; }

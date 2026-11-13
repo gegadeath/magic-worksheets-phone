@@ -29,6 +29,20 @@
     for (let i = 0, j = 0; i < g.length; i++, j += 4) g[i] = 0.299 * d[j] + 0.587 * d[j + 1] + 0.114 * d[j + 2];
     return { g, w, h };
   }
+  // Stretch to full contrast: the darkest 1% become black and the brightest 1% white. A washed-out or
+  // dim camera picture (grey "black", grey paper) then looks like a clean print to the checks below.
+  function stretch(G) {
+    const { g } = G, hist = new Uint32Array(256);
+    for (let i = 0; i < g.length; i++) hist[Math.max(0, Math.min(255, g[i] | 0))]++;
+    const cut = g.length * 0.01;
+    let lo = 0, hi = 255;
+    for (let acc = 0; lo < 255 && (acc += hist[lo]) < cut; lo++);
+    for (let acc = 0; hi > 0 && (acc += hist[hi]) < cut; hi--);
+    if (hi - lo < 24 || (lo < 12 && hi > 243)) return G;      // already full range (or nothing there)
+    const k = 255 / (hi - lo);
+    for (let i = 0; i < g.length; i++) g[i] = Math.max(0, Math.min(255, (g[i] - lo) * k));
+    return G;
+  }
 
   // ---------- marker detection ----------
   function darkMask({ g, w, h }) {
@@ -170,7 +184,7 @@
       const c = document.createElement('canvas'); c.width = Math.max(1, Math.round(sw * f)); c.height = Math.max(1, Math.round(sh * f));
       try {
         c.getContext('2d', { willReadFrequently: true }).drawImage(hi.source, x0, y0, sw, sh, 0, 0, c.width, c.height);
-        const Gh = gray(c), m = k * f;
+        const Gh = stretch(gray(c)), m = k * f;
         v = pts.map(([x, y]) => sampleBox(Gh, (x * k - x0) * f, (y * k - y0) * f, cellPx * m * 0.22));
       } catch (_) { v = null; }
     }
@@ -340,7 +354,7 @@
     const img = await loadImage(b64);
     const full = toCanvas(img, 2400);
     const small = toCanvas(full, 1100);
-    const G = gray(small);
+    const G = stretch(gray(small));
     const cands = markerCandidates(blobs(darkMask(G), G.w, G.h), G.w, G.h, G);
     const hit = locate(G, cands, paperFor, { source: full, scale: full.width / small.width });
     if (!hit || hit.geoOnly) return { ok: false };
@@ -358,9 +372,38 @@
 
   /** Find a smart page in one small camera frame (about 640 px wide). Fast enough for several frames a second.
    *  Returns the page's code and page number plus where its four corner squares and outline are in the frame. */
+  /** Follow a page found in an earlier frame. prev: an earlier detectFrame() result with ok:true.
+   *  Only the four corner squares are looked for, near where they were; the page code is not re-read
+   *  (it's the part a slightly blurry frame loses first). Returns the same shape as detectFrame(). */
+  function trackFrame(canvas, prev, source) {
+    if (!prev || !prev.ok || !prev.corners || !prev.P) return { ok: false };
+    const G = stretch(gray(canvas));
+    const cands = markerCandidates(blobs(darkMask(G), G.w, G.h), G.w, G.h, G);
+    if (cands.length < 4) return { ok: false };
+    const reach = Math.max(10, 0.08 * Math.max(G.w, G.h));
+    const used = new Set(), pts = [];
+    for (const [px, py] of prev.corners) {
+      let best = null, bd = reach;
+      for (const c of cands) { if (used.has(c)) continue; const d = Math.hypot(c.x - px, c.y - py); if (d < bd) { bd = d; best = c; } }
+      if (!best) return { ok: false };
+      used.add(best); pts.push([best.x, best.y]);
+    }
+    const P = prev.P, H = homography(markerCentres(P), pts);
+    if (!H || verify(G, H, P) === null) return { ok: false };
+    // Still try the code: if the student turned to another page (same squares, new code), notice it.
+    const sw = source ? (source.videoWidth || source.width) : 0;
+    const id = readStrip(G, H, P, sw ? { source, scale: sw / canvas.width } : null);
+    const code = id ? id.code : prev.code, page = id ? id.page : prev.page;
+    return {
+      ok: true, tracked: !id, code, page, paper: prev.paper, H, P,
+      corners: pts,
+      outline: [[0, 0], [P.w, 0], [P.w, P.h], [0, P.h]].map(([x, y]) => apply(H, x, y)),
+    };
+  }
+
   // source (optional): the same picture at full size (a <video> or canvas), used to read the small code strip.
   function detectFrame(canvas, paperFor, source) {
-    const G = gray(canvas);
+    const G = stretch(gray(canvas));
     const cands = markerCandidates(blobs(darkMask(G), G.w, G.h), G.w, G.h, G);
     const sw = source ? (source.videoWidth || source.width) : 0;
     const hit = locate(G, cands, paperFor, sw ? { source, scale: sw / canvas.width } : null);
@@ -382,7 +425,7 @@
   /** Same as analyze() for one photo, but from a canvas: finds the page and returns it straightened. */
   function analyzeCanvas(full, paperFor, k) {
     const small = toCanvas(full, 1100);
-    const G = gray(small);
+    const G = stretch(gray(small));
     const hit = locate(G, markerCandidates(blobs(darkMask(G), G.w, G.h), G.w, G.h, G), paperFor, { source: full, scale: full.width / small.width });
     if (!hit || hit.geoOnly) return { ok: false };
     const s = full.width / small.width;
@@ -596,5 +639,5 @@
     return { boards, questions: pieces.map(p => p.q) };
   }
 
-  root.SmartScan = { analyze, answerBoards, inkCheck, INK_EMPTY, detectFrame, analyzeCanvas, quality, evenLight, flattenDocument, toCanvas, _internal: { darkMask, blobs, markerCandidates, homography, apply, locate, gray, readStrip, verify, markerCentres, surround } };
+  root.SmartScan = { analyze, answerBoards, inkCheck, INK_EMPTY, trackFrame, detectFrame, analyzeCanvas, quality, evenLight, flattenDocument, toCanvas, _internal: { darkMask, blobs, markerCandidates, homography, apply, locate, gray, readStrip, verify, markerCentres, surround } };
 })(typeof self !== 'undefined' ? self : this);

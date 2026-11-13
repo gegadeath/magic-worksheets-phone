@@ -17,6 +17,8 @@
   const WORK = 640;          // long side of the frame that gets analysed (the code strip is read from the full frame)
   const TICK = 170;          // ms between looks
   const STEADY = 3;          // steady looks in a row before taking the photo
+  const HOLD_MS = 700;       // keep showing a found page this long through frames where it's lost
+  const TRACK_MS = 1500;     // follow a found page from frame to frame for this long after last seeing it
   const MOVE = 0.012;        // corners may move this share of the frame diagonal and still count as steady
 
   let cur = null;
@@ -37,6 +39,7 @@
         <button class="camTorch hidden" data-cam="torch" aria-label="Light">⚡</button>
       </div>
       <div class="camMsg"><b>Starting the camera…</b></div>
+      <button class="camSave hidden" data-cam="save">Not finding it? Save a test picture</button>
       <div class="camBottom">
         <span class="camHint">Pages with corner squares are taken by themselves</span>
         <button class="camShutter" data-cam="shoot" aria-label="Take the photo"><svg viewBox="0 0 80 80"><circle cx="40" cy="40" r="34" class="ringBg"/><circle cx="40" cy="40" r="34" class="ring"/></svg><i></i></button>
@@ -52,6 +55,7 @@
       if (a === 'close' || a === 'done') close();
       else if (a === 'shoot') capture(st, null);
       else if (a === 'torch') setTorch(st, !st.torch);
+      else if (a === 'save') saveTest(st);
     });
     try {
       st.stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: { ideal: 'environment' }, width: { ideal: 3840 }, height: { ideal: 2160 } } });
@@ -134,8 +138,23 @@
     const wx = st.work.getContext('2d', { willReadFrequently: true });
     wx.drawImage(v, 0, 0, w, h);
     const reg = st.opts.registry || {};
+    const now = Date.now();
     let hit;
-    try { hit = root.SmartScan.detectFrame(st.work, (c) => reg[c] && reg[c].paper, v); } catch (_) { hit = { ok: false }; }
+    try {
+      // Follow the page found a moment ago (fast, and works on frames too blurry to read the code);
+      // search the whole picture only when that fails.
+      if (st.last && now - st.last.at < TRACK_MS) hit = root.SmartScan.trackFrame(st.work, st.last.hit, v);
+      if (!hit || !hit.ok) hit = root.SmartScan.detectFrame(st.work, (c) => reg[c] && reg[c].paper, v);
+    } catch (_) { hit = { ok: false }; }
+    if (hit.ok || hit.squares) { st.missSince = null; $('.camSave', st.el).classList.add('hidden'); }
+    else if (!st.missSince) st.missSince = now;
+    else if (now - st.missSince > 5000) $('.camSave', st.el).classList.remove('hidden');
+    if (hit.ok) st.last = { hit, at: now };
+    else if (st.last && now - st.last.at < HOLD_MS) {
+      // A frame or two lost (hand moved, camera refocusing): keep showing the page and the countdown.
+      paint(st, st.last.hit, st.steady >= STEADY ? 'go' : '');
+      return;
+    }
     const q = root.SmartScan.quality(st.work);
     // A code that isn't in the library has to be seen twice in a row before we say so (one misread
     // frame shouldn't flash a red warning).
@@ -184,6 +203,24 @@
     if (st.steady < STEADY) return say(st, 'Hold still…', `Found ${label}.`);
     st.steady = 0;
     capture(st, hit);
+  }
+  // Save exactly what the camera sees (full size), so a scanning problem can be looked at on a computer.
+  function saveTest(st) {
+    const v = st.video;
+    if (!v.videoWidth) return;
+    const c = document.createElement('canvas'); c.width = v.videoWidth; c.height = v.videoHeight;
+    c.getContext('2d').drawImage(v, 0, 0);
+    c.toBlob((blob) => {
+      if (!blob) return;
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `scan-test-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.jpg`;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+      const btn = $('.camSave', st.el);
+      btn.textContent = 'Saved to Downloads ✓';
+      setTimeout(() => { btn.textContent = 'Not finding it? Save a test picture'; }, 4000);
+    }, 'image/jpeg', 0.92);
   }
   function nextMissing(st, code, pages) {
     for (let i = 0; i < pages; i++) if (!st.opts.has(code, i)) return i;

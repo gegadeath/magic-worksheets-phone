@@ -2,7 +2,7 @@
    finishes sending scans in the background when the connection comes back (Background Sync).
    Data always comes fresh from the network; the app keeps its own copy for offline viewing. */
 importScripts('./lib/outbox.js');
-const CACHE = 'ws-app-v4';
+const CACHE = 'ws-app-v5';
 const SHELL = ['./', './index.html', './app.css', './app.js', './lib/render.js', './lib/smartscan.js', './lib/pages.js', './lib/camera.js', './lib/outbox.js',
   './manifest.webmanifest', './icons/icon-192.png', './icons/icon-512.png', './icons/maskable-192.png', './icons/maskable-512.png'];
 
